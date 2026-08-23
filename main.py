@@ -88,35 +88,35 @@ def check_version(version: dict, policy: dict, as_of: datetime) -> list[str]:
         codes.add("MISSING_EVALUATION")
         return sorted(codes)
 
-    # ---- 1. finiteness of core numeric metrics -----------------------
+    # ---- 1. finiteness of core numeric metrics ------------------------
+    # NOTE: only accuracy/latency/size participate in NON_FINITE per spec.
+    # Slice finiteness problems are reported as SLICE_RANGE:<name> instead
+    # (handled in section 5), never as the generic NON_FINITE code.
     accuracy = evaluation.get("accuracy")
     latency = evaluation.get("latencyMs")
     size = evaluation.get("sizeBytes")
     slices = evaluation.get("slices")
 
-    non_finite = False
-    if not is_finite_number(accuracy):
-        non_finite = True
-    if not is_finite_number(latency):
-        non_finite = True
-    if not is_finite_number(size):
-        non_finite = True
-    if slices is not None and isinstance(slices, dict):
-        for v in slices.values():
-            if not is_finite_number(v):
-                non_finite = True
-    elif slices is not None:
-        non_finite = True
+    accuracy_finite = is_finite_number(accuracy)
+    latency_finite = is_finite_number(latency)
+    size_finite = is_finite_number(size)
 
-    if non_finite:
+    if not (accuracy_finite and latency_finite and size_finite):
         codes.add("NON_FINITE")
 
-    # ---- 2. metric range checks (only meaningful if finite) ----------
-    if is_finite_number(accuracy) and not in_unit_interval(accuracy):
+    # ---- 2. metric range checks (only for fields that are finite) -----
+    # Track per-field range validity so downstream floor/limit gates
+    # don't ALSO fire for a value that's already out of range -- that
+    # would double-report a single fault as two gate codes.
+    accuracy_in_range = accuracy_finite and in_unit_interval(accuracy)
+    latency_in_range = latency_finite and is_nonneg_finite(latency)
+    size_in_range = size_finite and is_nonneg_finite(size)
+
+    if accuracy_finite and not accuracy_in_range:
         codes.add("METRIC_RANGE")
-    if is_finite_number(latency) and not is_nonneg_finite(latency):
+    if latency_finite and not latency_in_range:
         codes.add("METRIC_RANGE")
-    if is_finite_number(size) and not is_nonneg_finite(size):
+    if size_finite and not size_in_range:
         codes.add("METRIC_RANGE")
 
     # ---- 3. timestamp / freshness -------------------------------------
@@ -157,19 +157,22 @@ def check_version(version: dict, policy: dict, as_of: datetime) -> list[str]:
         if is_finite_number(floor) and float(val) < float(floor):
             codes.add(f"SLICE_FLOOR:{name}")
 
-    # ---- 6. aggregate gates ----------------------------------------------
+    # ---- 6. aggregate gates ------------------------------------------
+    # Only meaningful once the underlying value is confirmed finite AND
+    # in-range -- an out-of-range value already failed METRIC_RANGE and
+    # should not also fail its floor/limit gate for the same fault.
     accuracy_floor = policy.get("accuracyFloor")
-    if is_finite_number(accuracy) and is_finite_number(accuracy_floor):
+    if accuracy_in_range and is_finite_number(accuracy_floor):
         if float(accuracy) < float(accuracy_floor):
             codes.add("ACCURACY_FLOOR")
 
     max_latency = policy.get("maxLatencyMs")
-    if is_finite_number(latency) and is_finite_number(max_latency):
+    if latency_in_range and is_finite_number(max_latency):
         if float(latency) > float(max_latency):
             codes.add("LATENCY_LIMIT")
 
     max_size = policy.get("maxSizeBytes")
-    if is_finite_number(size) and is_finite_number(max_size):
+    if size_in_range and is_finite_number(max_size):
         if float(size) > float(max_size):
             codes.add("SIZE_LIMIT")
 
@@ -216,7 +219,7 @@ def version_sort_key(v: dict):
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/q3/promote")
+@app.post("/promote")
 async def promote(request: Request):
     try:
         body = await request.json()
