@@ -171,22 +171,22 @@ def gate_codes_for_version(
             codes.add(f"MISSING_SLICE:{name}")
             continue
         val = eval_slices[name]
+        val_finite = is_finite_number(val)
         if not in_unit_interval(val):
             codes.add(f"SLICE_RANGE:{name}")
-            continue
-        if is_finite_number(floor) and float(val) < float(floor):
+        if val_finite and is_finite_number(floor) and float(val) < float(floor):
             codes.add(f"SLICE_FLOOR:{name}")
 
     accuracy_floor = policy.get("accuracyFloor")
-    if accuracy_in_range and is_finite_number(accuracy_floor) and float(accuracy) < float(accuracy_floor):
+    if accuracy_finite and is_finite_number(accuracy_floor) and float(accuracy) < float(accuracy_floor):
         codes.add("ACCURACY_FLOOR")
 
     max_latency = policy.get("maxLatencyMs")
-    if latency_in_range and is_finite_number(max_latency) and float(latency) > float(max_latency):
+    if latency_finite and is_finite_number(max_latency) and float(latency) > float(max_latency):
         codes.add("LATENCY_LIMIT")
 
     max_size = policy.get("maxSizeBytes")
-    if size_in_range and is_finite_number(max_size) and float(size) > float(max_size):
+    if size_finite and is_finite_number(max_size) and float(size) > float(max_size):
         codes.add("SIZE_LIMIT")
 
     return codes
@@ -307,147 +307,3 @@ async def promote(request: Request):
     }
     logger.info("RESPONSE /promote: %s", json.dumps(resp))
     return JSONResponse(status_code=200, content=resp)
-
-# async def promote(request: Request):
-#     try:
-#         body = await request.json()
-#     except Exception:
-#         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
-#     if not isinstance(body, dict):
-#         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
-#     policy = body.get("policy")
-#     versions = body.get("versions")
-#     champion_version = body.get("championVersion")
-#     as_of_raw = body.get("asOf")
-
-#     if policy is None or not isinstance(versions, list) or not isinstance(champion_version, str):
-#         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
-#     as_of = parse_timestamp(as_of_raw)
-#     policy_valid = validate_policy(policy)
-
-#     failed_gates: dict[str, list[str]] = {}
-#     eligible: list[dict] = []
-#     seen_ids: dict[str, int] = {}
-
-#     # Pass 1: find duplicates / noncanonical ids among ALL versions first
-#     raw_ids = []
-#     for v in versions:
-#         vid = v.get("version") if isinstance(v, dict) else None
-#         raw_ids.append(vid)
-#         if isinstance(vid, str):
-#             seen_ids[vid] = seen_ids.get(vid, 0) + 1
-
-#     canonical_map: dict[str, dict] = {}
-
-#     for v, vid in zip(versions, raw_ids):
-#         if not isinstance(v, dict) or not isinstance(vid, str):
-#             # can't even key this in failedGates meaningfully if vid isn't a string;
-#             # skip silently (malformed entry) -- grader focuses on string version ids
-#             continue
-
-#         codes: set[str] = set()
-#         if not is_canonical_version_id(vid):
-#             codes.add("INVALID_VERSION")
-#         elif seen_ids.get(vid, 0) > 1:
-#             codes.add("DUPLICATE_VERSION")
-
-#         if codes:
-#             existing = set(failed_gates.get(vid, []))
-#             failed_gates[vid] = sorted(existing | codes)
-#             continue  # rejected before lookup map construction
-
-#         # only now do we add it to the canonical lookup map
-#         canonical_map[vid] = v
-
-#     # Pass 2: policy-level validity check
-#     if not policy_valid:
-#         for vid, v in canonical_map.items():
-#             existing = set(failed_gates.get(vid, []))
-#             existing.add("INVALID_POLICY")
-#             failed_gates[vid] = sorted(existing)
-#         return JSONResponse(status_code=200, content={
-#             "action": "block",
-#             "championVersion": champion_version,
-#             "selectedVersion": None,
-#             "eligibleVersions": [],
-#             "failedGates": failed_gates,
-#             "aliasMutation": None,
-#             "evidence": None,
-#         })
-
-#     if as_of is None:
-#         # asOf itself is unparseable -- treat as invalid policy input context;
-#         # every version fails timestamp comparison
-#         for vid, v in canonical_map.items():
-#             existing = set(failed_gates.get(vid, []))
-#             existing.add("INVALID_TIMESTAMP")
-#             failed_gates[vid] = sorted(existing)
-#         return JSONResponse(status_code=200, content={
-#             "action": "block",
-#             "championVersion": champion_version,
-#             "selectedVersion": None,
-#             "eligibleVersions": [],
-#             "failedGates": failed_gates,
-#             "aliasMutation": None,
-#             "evidence": None,
-#         })
-
-#     # Pass 3: per-version gate checks
-#     for vid, v in canonical_map.items():
-#         codes = check_version(v, policy, as_of)
-#         if codes:
-#             existing = set(failed_gates.get(vid, []))
-#             failed_gates[vid] = sorted(existing | set(codes))
-#         else:
-#             failed_gates.setdefault(vid, [])
-#             eligible.append(v)
-
-#     eligible_ids = sorted((v["version"] for v in eligible), key=lambda x: int(x))
-
-#     champion = canonical_map.get(champion_version)
-#     champion_eligible = (
-#         champion is not None
-#         and champion_version in {v["version"] for v in eligible}
-#     )
-
-#     if not champion_eligible:
-#         return JSONResponse(status_code=200, content={
-#             "action": "block",
-#             "championVersion": champion_version,
-#             "selectedVersion": None,
-#             "eligibleVersions": eligible_ids,
-#             "failedGates": failed_gates,
-#             "aliasMutation": None,
-#             "evidence": None,
-#         })
-
-#     ranked = sorted(eligible, key=version_sort_key)
-#     challenger = ranked[0]
-
-#     champion_acc = float(champion["evaluation"]["accuracy"])
-#     challenger_acc = float(challenger["evaluation"]["accuracy"])
-#     improvement = round(challenger_acc - champion_acc, 12)
-#     min_improvement = float(policy["minImprovement"])
-
-#     if challenger["version"] != champion_version and improvement >= min_improvement:
-#         selected = challenger
-#         action = "promote"
-#         alias_mutation = {"alias": "champion", "version": selected["version"]}
-#     else:
-#         selected = champion
-#         action = "retain"
-#         alias_mutation = None
-
-#     return JSONResponse(status_code=200, content={
-#         "action": action,
-#         "championVersion": champion_version,
-#         "selectedVersion": selected["version"],
-#         "eligibleVersions": eligible_ids,
-#         "failedGates": failed_gates,
-#         "aliasMutation": alias_mutation,
-#         "evidence": selected["evaluation"],
-#     })
-
