@@ -699,10 +699,11 @@ def handle_repair(body: dict):
 
 
 @app.post("/q4/adapt")
+
 async def adapt_endpoint(request: Request):
     try:
         raw_body = await request.body()
-        body = request.json()  # or await request.json() if needed
+        body = await request.json()  # <-- add await here
         if isinstance(body, dict):
             logger.info("REQUEST /adapt: %s", json.dumps(body, ensure_ascii=False))
         else:
