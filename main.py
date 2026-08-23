@@ -219,7 +219,7 @@ def version_sort_key(v: dict):
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/promote")
+@app.post("/q3/promote")
 async def promote(request: Request):
     try:
         body = await request.json()
