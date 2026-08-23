@@ -26,6 +26,22 @@ TIMESTAMP_RE = re.compile(
 )
 
 
+def version_key(raw: Any) -> Optional[str]:
+    """Turn any JSON-scalar version id into a stable string key for the
+    failedGates/eligibility maps -- even if it's the wrong type (e.g. a
+    JSON number) and therefore doomed to fail canonical-id validation.
+    A malformed version must still be REPORTED, not silently dropped."""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, bool):
+        return json.dumps(raw)
+    if isinstance(raw, (int, float)):
+        return json.dumps(raw)
+    if raw is None:
+        return json.dumps(raw)
+    return None  # unkeyable (list/dict) -- nothing sane to report under
+
+
 def is_canonical_version_id(v: Any) -> bool:
     if not isinstance(v, str) or not CANONICAL_ID_RE.match(v):
         return False
@@ -233,12 +249,14 @@ async def promote(request: Request):
     as_of = parse_timestamp(as_of_raw)
     policy_valid = validate_policy(policy)
 
-    # Count occurrences of each version-id string to detect duplicates.
+    # Count occurrences of each version-id key (including malformed/non-string
+    # ids, so duplicates of a bad id are still detected) to flag duplicates.
     id_counts: dict[str, int] = {}
     for v in versions:
-        if isinstance(v, dict) and isinstance(v.get("version"), str):
-            vid = v["version"]
-            id_counts[vid] = id_counts.get(vid, 0) + 1
+        if isinstance(v, dict):
+            key = version_key(v.get("version"))
+            if key is not None:
+                id_counts[key] = id_counts.get(key, 0) + 1
 
     failed_gates: dict[str, list[str]] = {}
     eligible_by_id: dict[str, dict] = {}
@@ -246,12 +264,13 @@ async def promote(request: Request):
     for v in versions:
         if not isinstance(v, dict):
             continue
-        vid = v.get("version")
-        if not isinstance(vid, str):
+        raw_vid = v.get("version")
+        vid = version_key(raw_vid)
+        if vid is None:
             continue
 
         is_duplicate = id_counts.get(vid, 0) > 1
-        codes = gate_codes_for_version(v, vid, is_duplicate, policy, policy_valid, as_of)
+        codes = gate_codes_for_version(v, raw_vid, is_duplicate, policy, policy_valid, as_of)
 
         existing = set(failed_gates.get(vid, []))
         failed_gates[vid] = sorted(existing | codes)
