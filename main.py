@@ -562,8 +562,10 @@ def handle_repair(body: dict):
     # Parameters & trainable
     parameters = body.get("parameters")
     allowed_targets = body.get("allowedTargets")
+    artifact_files = body.get("artifactFiles")
 
     peft_config_pass = True
+    reason_codes = []
 
     if not validate_parameters(parameters, allowed_targets):
         peft_config_pass = False
@@ -579,6 +581,21 @@ def handle_repair(body: dict):
             trainable_count = 0
         else:
             peft_config_pass = True
+
+    # Adapter files
+    EXPECTED_ADAPTER_FILES = ["adapter_config.json", "adapter_model.safetensors"]
+
+    if not isinstance(artifact_files, list):
+        peft_config_pass = False
+        reason_codes.append("ADAPTER_FILE_SET")
+        adapter_files = []
+    else:
+        if sorted(artifact_files) != sorted(EXPECTED_ADAPTER_FILES):
+            peft_config_pass = False
+            reason_codes.append("ADAPTER_FILE_SET")
+            adapter_files = sorted(EXPECTED_ADAPTER_FILES)
+        else:
+            adapter_files = sorted(artifact_files)
 
     # Inference mode & adapter files
     inference_mode = body.get("inferenceMode")
