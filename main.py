@@ -394,6 +394,7 @@ def validate_parameters(parameters, allowed_targets):
         return False
     if not isinstance(allowed_targets, list) or len(allowed_targets) == 0:
         return False
+    allowed_set = set(allowed_targets)
 
     names = set()
     for p in parameters:
@@ -411,6 +412,9 @@ def validate_parameters(parameters, allowed_targets):
         if name in names:
             return False
         names.add(name)
+        # Enforce: every parameter's target must be in allowedTargets
+        if target not in allowed_set:
+            return False
 
     if len(allowed_targets) != len(set(allowed_targets)):
         return False
@@ -608,6 +612,7 @@ def handle_repair(body: dict):
     dataset_digest = body.get("datasetDigest")
     code_digest = body.get("codeDigest")
     config_digest = body.get("configDigest")
+    expected_digests = body.get("expectedDigests") or {}
 
     lineage_pass = True
     if not is_hex(base_rev, 40):
@@ -620,6 +625,19 @@ def handle_repair(body: dict):
     ):
         lineage_pass = False
         reason_codes.append("LINEAGE_MISMATCH")
+    
+    else:
+        # Check against expectedDigests if present
+        if expected_digests.get("datasetDigest") != dataset_digest:
+            lineage_pass = False
+            reason_codes.append("LINEAGE_MISMATCH")
+        if expected_digests.get("codeDigest") != code_digest:
+            lineage_pass = False
+            reason_codes.append("LINEAGE_MISMATCH")
+        if expected_digests.get("configDigest") != config_digest:
+            lineage_pass = False
+            reason_codes.append("LINEAGE_MISMATCH")
+
 
     # Batch factors
     micro_batch = body.get("microBatch")
