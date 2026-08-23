@@ -225,6 +225,110 @@ def version_sort_key(v: dict):
 # ---------------------------------------------------------------------------
 
 @app.post("/q3/promote")
+async def promote(request: Request):
+    raw_body = await request.body()
+    logger.info("REQUEST /promote: %s", raw_body.decode("utf-8", errors="replace"))
+
+    try:
+        body = json.loads(raw_body)
+    except Exception:
+        logger.info("RESPONSE /promote: 400 INVALID_INPUT (bad JSON)")
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
+    if not isinstance(body, dict):
+        logger.info("RESPONSE /promote: 400 INVALID_INPUT (body not an object)")
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
+    policy = body.get("policy")
+    versions = body.get("versions")
+    champion_version = body.get("championVersion")
+    as_of_raw = body.get("asOf")
+
+    if policy is None or not isinstance(versions, list) or not isinstance(champion_version, str):
+        logger.info("RESPONSE /promote: 400 INVALID_INPUT (missing policy/versions/championVersion)")
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
+    as_of = parse_timestamp(as_of_raw)
+    policy_valid = validate_policy(policy)
+
+    # Count occurrences of each version-id string to detect duplicates.
+    id_counts: dict[str, int] = {}
+    for v in versions:
+        if isinstance(v, dict) and isinstance(v.get("version"), str):
+            vid = v["version"]
+            id_counts[vid] = id_counts.get(vid, 0) + 1
+
+    failed_gates: dict[str, list[str]] = {}
+    eligible_by_id: dict[str, dict] = {}
+
+    for v in versions:
+        if not isinstance(v, dict):
+            continue
+        vid = v.get("version")
+        if not isinstance(vid, str):
+            continue
+
+        is_duplicate = id_counts.get(vid, 0) > 1
+        codes = gate_codes_for_version(v, vid, is_duplicate, policy, policy_valid, as_of)
+
+        existing = set(failed_gates.get(vid, []))
+        failed_gates[vid] = sorted(existing | codes)
+
+        # A version is eligible only if it is canonical+unique AND has
+        # zero gate codes overall, AND (in case of a duplicate id) only
+        # the first clean occurrence is kept as the candidate for ranking.
+        if not codes and vid not in eligible_by_id:
+            eligible_by_id[vid] = v
+
+    eligible_versions_ranked = sorted(eligible_by_id.values(), key=version_sort_key)
+    eligible_ids_ranked = [v["version"] for v in eligible_versions_ranked]
+
+    champion = eligible_by_id.get(champion_version)
+
+    if champion is None:
+        resp = {
+            "action": "block",
+            "championVersion": champion_version,
+            "selectedVersion": None,
+            "eligibleVersions": eligible_ids_ranked,
+            "failedGates": failed_gates,
+            "aliasMutation": None,
+            "evidence": None,
+        }
+        logger.info("RESPONSE /promote: %s", json.dumps(resp))
+        return JSONResponse(status_code=200, content=resp)
+
+    challenger = eligible_versions_ranked[0]
+
+    champion_acc = float(champion["evaluation"]["accuracy"])
+    challenger_acc = float(challenger["evaluation"]["accuracy"])
+    improvement = round(challenger_acc - champion_acc, 12)
+    min_improvement = float(policy["minImprovement"])
+
+    if challenger["version"] != champion_version and improvement >= min_improvement:
+        selected = challenger
+        action = "promote"
+        alias_mutation = {"alias": "champion", "version": selected["version"]}
+    else:
+        selected = champion
+        action = "retain"
+        alias_mutation = None
+
+    resp = {
+        "action": action,
+        "championVersion": champion_version,
+        "selectedVersion": selected["version"],
+        "eligibleVersions": eligible_ids_ranked,
+        "failedGates": failed_gates,
+        "aliasMutation": alias_mutation,
+        "evidence": selected["evaluation"],
+    }
+    logger.info("RESPONSE /promote: %s", json.dumps(resp))
+    return JSONResponse(status_code=200, content=resp)
+
+
+
+
 # async def promote(request: Request):
 #     try:
 #         body = await request.json()
@@ -368,105 +472,3 @@ def version_sort_key(v: dict):
 #         "evidence": selected["evaluation"],
 #     })
 
-
-    async def promote(request: Request):
-        raw_body = await request.body()
-        logger.info("REQUEST /promote: %s", raw_body.decode("utf-8", errors="replace"))
-    
-        try:
-            body = json.loads(raw_body)
-        except Exception:
-            logger.info("RESPONSE /promote: 400 INVALID_INPUT (bad JSON)")
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-    
-        if not isinstance(body, dict):
-            logger.info("RESPONSE /promote: 400 INVALID_INPUT (body not an object)")
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-    
-        policy = body.get("policy")
-        versions = body.get("versions")
-        champion_version = body.get("championVersion")
-        as_of_raw = body.get("asOf")
-    
-        if policy is None or not isinstance(versions, list) or not isinstance(champion_version, str):
-            logger.info("RESPONSE /promote: 400 INVALID_INPUT (missing policy/versions/championVersion)")
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-    
-        as_of = parse_timestamp(as_of_raw)
-        policy_valid = validate_policy(policy)
-    
-        # Count occurrences of each version-id string to detect duplicates.
-        id_counts: dict[str, int] = {}
-        for v in versions:
-            if isinstance(v, dict) and isinstance(v.get("version"), str):
-                vid = v["version"]
-                id_counts[vid] = id_counts.get(vid, 0) + 1
-    
-        failed_gates: dict[str, list[str]] = {}
-        eligible_by_id: dict[str, dict] = {}
-    
-        for v in versions:
-            if not isinstance(v, dict):
-                continue
-            vid = v.get("version")
-            if not isinstance(vid, str):
-                continue
-    
-            is_duplicate = id_counts.get(vid, 0) > 1
-            codes = gate_codes_for_version(v, vid, is_duplicate, policy, policy_valid, as_of)
-    
-            existing = set(failed_gates.get(vid, []))
-            failed_gates[vid] = sorted(existing | codes)
-    
-            # A version is eligible only if it is canonical+unique AND has
-            # zero gate codes overall, AND (in case of a duplicate id) only
-            # the first clean occurrence is kept as the candidate for ranking.
-            if not codes and vid not in eligible_by_id:
-                eligible_by_id[vid] = v
-    
-        eligible_versions_ranked = sorted(eligible_by_id.values(), key=version_sort_key)
-        eligible_ids_ranked = [v["version"] for v in eligible_versions_ranked]
-    
-        champion = eligible_by_id.get(champion_version)
-    
-        if champion is None:
-            resp = {
-                "action": "block",
-                "championVersion": champion_version,
-                "selectedVersion": None,
-                "eligibleVersions": eligible_ids_ranked,
-                "failedGates": failed_gates,
-                "aliasMutation": None,
-                "evidence": None,
-            }
-            logger.info("RESPONSE /promote: %s", json.dumps(resp))
-            return JSONResponse(status_code=200, content=resp)
-    
-        challenger = eligible_versions_ranked[0]
-    
-        champion_acc = float(champion["evaluation"]["accuracy"])
-        challenger_acc = float(challenger["evaluation"]["accuracy"])
-        improvement = round(challenger_acc - champion_acc, 12)
-        min_improvement = float(policy["minImprovement"])
-    
-        if challenger["version"] != champion_version and improvement >= min_improvement:
-            selected = challenger
-            action = "promote"
-            alias_mutation = {"alias": "champion", "version": selected["version"]}
-        else:
-            selected = champion
-            action = "retain"
-            alias_mutation = None
-    
-        resp = {
-            "action": action,
-            "championVersion": champion_version,
-            "selectedVersion": selected["version"],
-            "eligibleVersions": eligible_ids_ranked,
-            "failedGates": failed_gates,
-            "aliasMutation": alias_mutation,
-            "evidence": selected["evaluation"],
-        }
-        logger.info("RESPONSE /promote: %s", json.dumps(resp))
-        return JSONResponse(status_code=200, content=resp)
-    
