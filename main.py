@@ -17,6 +17,11 @@ app = FastAPI()
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+##############################
+#-------------q3--------------
+##############################
+
 CANONICAL_ID_RE = re.compile(r"^[1-9][0-9]*$")
 
 TIMESTAMP_RE = re.compile(
@@ -326,3 +331,396 @@ async def promote(request: Request):
     }
     logger.info("RESPONSE /promote: %s", json.dumps(resp))
     return JSONResponse(status_code=200, content=resp)
+
+
+################################
+#------------q4-----------------
+################################
+
+# main.py
+
+
+INTERVENTION_ORDER = ["prompt_only", "retrieval", "lora", "qlora"]
+VALID_ROLES = {"system", "user", "assistant"}
+EXPECTED_ADAPTER_FILES = ["adapter_config.json", "adapter_model.safetensors"]
+REQUIRED_CHECKPOINT_KEYS = {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}
+
+
+def is_hex(s: str, length: int) -> bool:
+    if not isinstance(s, str) or len(s) != length:
+        return False
+    return bool(re.fullmatch(r"[0-9a-f]{" + str(length) + "}", s))
+
+
+def is_finite_number(x) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def is_positive_int(x) -> bool:
+    return isinstance(x, int) and x > 0
+
+
+def validate_tokens(tokens):
+    if not isinstance(tokens, list) or len(tokens) == 0:
+        return False
+    for t in tokens:
+        if not isinstance(t, dict):
+            return False
+        if set(t.keys()) != {"id", "role", "padding", "text"}:
+            return False
+        if not isinstance(t["id"], int) or t["id"] < 0:
+            return False
+        if t["role"] not in VALID_ROLES:
+            return False
+        if not isinstance(t["padding"], bool):
+            return False
+        if not isinstance(t["text"], str):
+            return False
+    return True
+
+
+def compute_labels(tokens):
+    labels = []
+    for t in tokens:
+        if t["role"] == "assistant" and not t["padding"]:
+            labels.append(t["id"])
+        else:
+            labels.append(-100)
+    return labels
+
+
+def validate_parameters(parameters, allowed_targets):
+    if not isinstance(parameters, list) or len(parameters) == 0:
+        return False
+    if not isinstance(allowed_targets, list) or len(allowed_targets) == 0:
+        return False
+
+    names = set()
+    for p in parameters:
+        if not isinstance(p, dict):
+            return False
+        if set(p.keys()) != {"name", "target", "numel"}:
+            return False
+        name = p["name"]
+        target = p["target"]
+        numel = p["numel"]
+        if not isinstance(name, str) or not isinstance(target, str):
+            return False
+        if not isinstance(numel, int) or numel <= 0:
+            return False
+        if name in names:
+            return False
+        names.add(name)
+
+    if len(allowed_targets) != len(set(allowed_targets)):
+        return False
+    for t in allowed_targets:
+        if not isinstance(t, str):
+            return False
+    return True
+
+
+def compute_trainable_params(parameters, allowed_targets):
+    trainable = []
+    total_numel = 0
+    for p in parameters:
+        if p["target"] in allowed_targets:
+            name = p["name"]
+            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                trainable.append(name)
+                total_numel += p["numel"]
+    trainable = sorted(trainable)
+    return trainable, total_numel
+
+
+def is_unique_nonempty_str_list(lst):
+    if not isinstance(lst, list) or len(lst) == 0:
+        return False
+    if not all(isinstance(x, str) for x in lst):
+        return False
+    return len(lst) == len(set(lst))
+
+
+def handle_choose(body: dict):
+    policy = body.get("policy")
+    candidates = body.get("candidates")
+
+    if not isinstance(policy, dict) or not isinstance(candidates, list):
+        return None
+
+    required_policy_keys = [
+        "minQuality",
+        "freshnessRequired",
+        "maxLatencyMs",
+        "maxMemoryMb",
+        "maxLabeledExamples",
+        "maxTotalCost",
+        "horizonRequests",
+    ]
+    for k in required_policy_keys:
+        if k not in policy:
+            return None
+
+    min_quality = float(policy["minQuality"])
+    freshness_required = bool(policy["freshnessRequired"])
+    max_latency = float(policy["maxLatencyMs"])
+    max_memory = float(policy["maxMemoryMb"])
+    max_labeled = int(policy["maxLabeledExamples"])
+    max_total_cost = float(policy["maxTotalCost"])
+    horizon = float(policy["horizonRequests"])
+
+    cand_map = {}
+    for c in candidates:
+        if not isinstance(c, dict) or "name" not in c:
+            return None
+        cand_map[c["name"]] = c
+
+    for name in INTERVENTION_ORDER:
+        if name not in cand_map:
+            return None
+
+    eligible = []
+    total_costs = {}
+    reason_codes = {}
+
+    for name in INTERVENTION_ORDER:
+        c = cand_map[name]
+        try:
+            quality = float(c["quality"])
+            latency = float(c["latencyMs"])
+            memory = float(c["memoryMb"])
+            labeled = int(c["labeledExamples"])
+            one_time = float(c["oneTimeCost"])
+            recurring = float(c["recurringCost"])
+            available = bool(c["available"])
+            freshness = bool(c["freshness"])
+        except Exception:
+            return None
+
+        codes = []
+
+        if not available:
+            codes.append("UNAVAILABLE")
+        if quality < min_quality:
+            codes.append("QUALITY_FLOOR")
+        if freshness_required and not freshness:
+            codes.append("FRESHNESS_REQUIRED")
+        if latency > max_latency:
+            codes.append("LATENCY_LIMIT")
+        if memory > max_memory:
+            codes.append("MEMORY_LIMIT")
+        if labeled > max_labeled:
+            codes.append("DATA_LIMIT")
+
+        total_cost = one_time + horizon * recurring
+        total_cost = round(total_cost, 12)
+        total_costs[name] = total_cost
+
+        if total_cost > max_total_cost:
+            codes.append("COST_LIMIT")
+
+        codes = sorted(set(codes))
+        reason_codes[name] = codes
+
+        if len(codes) == 0:
+            eligible.append(name)
+
+    selected = eligible[0] if eligible else None
+
+    return {
+        "selected": selected,
+        "eligible": eligible,
+        "totalCosts": total_costs,
+        "reasonCodes": reason_codes,
+    }
+
+
+def handle_repair(body: dict):
+    reason_codes = []
+
+    # Tokens & labels
+    tokens = body.get("tokens")
+    if not validate_tokens(tokens):
+        if isinstance(tokens, list) and all(isinstance(t, dict) for t in tokens):
+            labels = [-100] * len(tokens)
+        else:
+            labels = []
+        reason_codes.append("INVALID_TOKEN")
+    else:
+        labels = compute_labels(tokens)
+
+    # Template applications
+    template_applications = body.get("templateApplications")
+    template_pass = template_applications == 1
+    if not template_pass:
+        reason_codes.append("CHAT_TEMPLATE_COUNT")
+
+    # Parameters & trainable
+    parameters = body.get("parameters")
+    allowed_targets = body.get("allowedTargets")
+
+    peft_config_pass = True
+
+    if not validate_parameters(parameters, allowed_targets):
+        peft_config_pass = False
+        reason_codes.append("INVALID_PARAMETER")
+        trainable_params = []
+        trainable_count = 0
+    else:
+        trainable_params, trainable_count = compute_trainable_params(parameters, allowed_targets)
+        if len(trainable_params) == 0:
+            peft_config_pass = False
+            reason_codes.append("INVALID_PARAMETER")
+            trainable_params = []
+            trainable_count = 0
+
+    # Inference mode & adapter files
+    inference_mode = body.get("inferenceMode")
+    dropout_active = body.get("dropoutActiveDuringEval")
+    artifact_files = body.get("artifactFiles")
+
+    if inference_mode is not False:
+        peft_config_pass = False
+        reason_codes.append("INFERENCE_MODE")
+
+    if not isinstance(artifact_files, list):
+        peft_config_pass = False
+        reason_codes.append("ADAPTER_FILE_SET")
+        adapter_files = []
+    else:
+        if sorted(artifact_files) != sorted(EXPECTED_ADAPTER_FILES):
+            peft_config_pass = False
+            reason_codes.append("ADAPTER_FILE_SET")
+            adapter_files = sorted(EXPECTED_ADAPTER_FILES)
+        else:
+            adapter_files = sorted(artifact_files)
+
+    # Checkpoint
+    checkpoint = body.get("checkpoint")
+    if not isinstance(checkpoint, dict) or not REQUIRED_CHECKPOINT_KEYS.issubset(checkpoint.keys()):
+        checkpoint_complete = False
+        reason_codes.append("INCOMPLETE_CHECKPOINT")
+    else:
+        checkpoint_complete = True
+
+    # Lineage
+    base_rev = body.get("baseRevision")
+    dataset_digest = body.get("datasetDigest")
+    code_digest = body.get("codeDigest")
+    config_digest = body.get("configDigest")
+
+    lineage_pass = True
+    if not is_hex(base_rev, 40):
+        lineage_pass = False
+        reason_codes.append("MUTABLE_BASE_REVISION")
+    if not (
+        is_hex(dataset_digest, 64)
+        and is_hex(code_digest, 64)
+        and is_hex(config_digest, 64)
+    ):
+        lineage_pass = False
+        reason_codes.append("LINEAGE_MISMATCH")
+
+    # Batch factors
+    micro_batch = body.get("microBatch")
+    grad_accum = body.get("gradientAccumulation")
+    replicas = body.get("replicas")
+    expected_eff_batch = body.get("expectedEffectiveBatch")
+
+    batch_ok = (
+        is_positive_int(micro_batch)
+        and is_positive_int(grad_accum)
+        and is_positive_int(replicas)
+        and is_positive_int(expected_eff_batch)
+        and (micro_batch * grad_accum * replicas == expected_eff_batch)
+    )
+    if not batch_ok:
+        reason_codes.append("EFFECTIVE_BATCH_MISMATCH")
+
+    # Eval isolation & determinism
+    train_ids = body.get("trainRowIds")
+    eval_ids = body.get("evalRowIds")
+
+    eval_isolated = True
+    evaluation_deterministic = True
+
+    if not (is_unique_nonempty_str_list(train_ids) and is_unique_nonempty_str_list(eval_ids)):
+        eval_isolated = False
+        reason_codes.append("EVAL_LEAKAGE")
+    elif set(train_ids) & set(eval_ids):
+        eval_isolated = False
+        reason_codes.append("EVAL_LEAKAGE")
+
+    if dropout_active is not False:
+        evaluation_deterministic = False
+        reason_codes.append("EVAL_DROPOUT_ACTIVE")
+
+    # Resume
+    uw = body.get("uninterruptedWeights")
+    rw = body.get("resumedWeights")
+    tol = body.get("resumeTolerance")
+
+    resume_pass = True
+    if (
+        not isinstance(uw, list)
+        or not isinstance(rw, list)
+        or len(uw) == 0
+        or len(rw) == 0
+        or len(uw) != len(rw)
+        or not all(is_finite_number(x) for x in uw)
+        or not all(is_finite_number(x) for x in rw)
+        or not is_finite_number(tol)
+        or tol < 0
+    ):
+        resume_pass = False
+        reason_codes.append("RESUME_DIVERGENCE")
+    else:
+        max_diff = max(abs(a - b) for a, b in zip(uw, rw))
+        if max_diff > tol:
+            resume_pass = False
+            reason_codes.append("RESUME_DIVERGENCE")
+
+    reason_codes = sorted(set(reason_codes))
+
+    return {
+        "labels": labels,
+        "templatePass": template_pass,
+        "trainableParams": trainable_params,
+        "trainableCount": trainable_count,
+        "peftConfigPass": peft_config_pass,
+        "adapterFiles": adapter_files,
+        "checkpointComplete": checkpoint_complete,
+        "lineagePass": lineage_pass,
+        "evalIsolated": eval_isolated,
+        "evaluationDeterministic": evaluation_deterministic,
+        "resumePass": resume_pass,
+        "reasonCodes": reason_codes,
+    }
+
+
+@app.post("/adapt")
+async def adapt_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
+    operation = body.get("operation")
+
+    if operation == "choose":
+        result = handle_choose(body)
+        if result is None:
+            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        return JSONResponse(status_code=200, content=result)
+
+    elif operation == "repair":
+        result = handle_repair(body)
+        if result is None:
+            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        return JSONResponse(status_code=200, content=result)
+
+    else:
+        return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
