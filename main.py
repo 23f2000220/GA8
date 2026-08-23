@@ -394,7 +394,13 @@ def validate_parameters(parameters, allowed_targets):
         return False
     if not isinstance(allowed_targets, list) or len(allowed_targets) == 0:
         return False
-    allowed_set = set(allowed_targets)
+
+    # allowedTargets must be unique strings
+    if len(allowed_targets) != len(set(allowed_targets)):
+        return False
+    for t in allowed_targets:
+        if not isinstance(t, str):
+            return False
 
     names = set()
     for p in parameters:
@@ -410,25 +416,19 @@ def validate_parameters(parameters, allowed_targets):
         if not isinstance(numel, int) or numel <= 0:
             return False
         if name in names:
-            return False
+            return False  # names must be unique
         names.add(name)
-        # Enforce: every parameter's target must be in allowedTargets
-        if target not in allowed_set:
-            return False
 
-    if len(allowed_targets) != len(set(allowed_targets)):
-        return False
-    for t in allowed_targets:
-        if not isinstance(t, str):
-            return False
     return True
 
 
+
 def compute_trainable_params(parameters, allowed_targets):
+    allowed_set = set(allowed_targets)
     trainable = []
     total_numel = 0
     for p in parameters:
-        if p["target"] in allowed_targets:
+        if p["target"] in allowed_set:
             name = p["name"]
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 trainable.append(name)
@@ -577,6 +577,8 @@ def handle_repair(body: dict):
             reason_codes.append("INVALID_PARAMETER")
             trainable_params = []
             trainable_count = 0
+        else:
+            peft_config_pass = True
 
     # Inference mode & adapter files
     inference_mode = body.get("inferenceMode")
