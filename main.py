@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(name)s - %(message)s")
 logger = logging.getLogger("promote")
 
 app = FastAPI()
@@ -698,14 +698,21 @@ def handle_repair(body: dict):
     }
 
 
-@app.post("/adapt")
+@app.post("/q4/adapt")
 async def adapt_endpoint(request: Request):
     try:
-        body = await request.json()
-    except Exception:
+        raw_body = await request.body()
+        body = request.json()  # or await request.json() if needed
+        if isinstance(body, dict):
+            logger.info("REQUEST /adapt: %s", json.dumps(body, ensure_ascii=False))
+        else:
+            logger.info("REQUEST /adapt (non-dict): %s", raw_body.decode("utf-8", errors="replace"))
+    except Exception as e:
+        logger.info("REQUEST /adapt (parse error): %s", e)
         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
 
     if not isinstance(body, dict):
+        logger.info("REQUEST /adapt (invalid top-level): %s", body)
         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
 
     operation = body.get("operation")
@@ -713,14 +720,19 @@ async def adapt_endpoint(request: Request):
     if operation == "choose":
         result = handle_choose(body)
         if result is None:
+            logger.info("RESPONSE /adapt (choose): 400 INVALID_INPUT")
             return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        logger.info("RESPONSE /adapt (choose): %s", json.dumps(result, ensure_ascii=False))
         return JSONResponse(status_code=200, content=result)
 
     elif operation == "repair":
         result = handle_repair(body)
         if result is None:
+            logger.info("RESPONSE /adapt (repair): 400 INVALID_INPUT")
             return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+        logger.info("RESPONSE /adapt (repair): %s", json.dumps(result, ensure_ascii=False))
         return JSONResponse(status_code=200, content=result)
 
     else:
+        logger.info("RESPONSE /adapt (unknown operation): 400 INVALID_INPUT")
         return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
