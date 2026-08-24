@@ -1127,5 +1127,5 @@ async def quantize(request: Request):
         response = build_select_response(body, freeze_id, frozen_response)
         return JSONResponse(response)
 
-    else:
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    # else:
+    #     return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
