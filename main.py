@@ -1148,7 +1148,7 @@ async def quantize(request: Request):
             else:
                 return JSONResponse({"error": "FREEZE_ID_CONFLICT"}, status_code=409)
 
-        if not validate_freeze_input(body):
+        if not get_freeze_validation_errors(body):
             return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
 
         response = build_freeze_response(body)
@@ -1157,7 +1157,7 @@ async def quantize(request: Request):
         return JSONResponse(response)
 
     elif phase == "select":
-        if not validate_select_input(body):
+        if not get_select_validation_errors(body):
             return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
 
         freeze_id = body.get("freezeId")
