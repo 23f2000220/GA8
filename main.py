@@ -1417,28 +1417,36 @@ def validate_request(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str |
 def compute_cache_key(node: str, inputs: dict[str, Any], nodes_state: dict[str, dict[str, Any]]) -> str:
     """
     Compute cache key for a node given inputs and upstream artifact digests.
+    Parent artifact is only used if parent is succeeded; otherwise it's None.
     """
     if node == "verify_data":
         arr = [inputs["generation"], inputs["checksum"]]
     elif node == "prepare":
         arr = [inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]]
     elif node == "train":
-        prepare_art = nodes_state["prepare"]["artifact_digest"]
+        prepare_art = None
+        if nodes_state["prepare"]["status"] == "succeeded":
+            prepare_art = nodes_state["prepare"]["artifact_digest"]
         arr = [prepare_art, inputs["trainCode"], inputs["trainConfig"], inputs["runtime"]]
     elif node == "evaluate":
-        train_art = nodes_state["train"]["artifact_digest"]
+        train_art = None
+        if nodes_state["train"]["status"] == "succeeded":
+            train_art = nodes_state["train"]["artifact_digest"]
         arr = [train_art, inputs["canonicalData"], inputs["evaluateCode"], inputs["evaluateConfig"]]
     elif node == "register":
-        evaluate_art = nodes_state["evaluate"]["artifact_digest"]
+        evaluate_art = None
+        if nodes_state["evaluate"]["status"] == "succeeded":
+            evaluate_art = nodes_state["evaluate"]["artifact_digest"]
         arr = [evaluate_art, inputs["schemaDigest"]]
     elif node == "publish":
-        register_art = nodes_state["register"]["artifact_digest"]
+        register_art = None
+        if nodes_state["register"]["status"] == "succeeded":
+            register_art = nodes_state["register"]["artifact_digest"]
         arr = [register_art, inputs["publishConfig"]]
     else:
         raise ValueError(f"Unknown node: {node}")
 
     return sha256_hex(arr)
-
 
 def validate_event_structure(event: dict[str, Any]) -> str | None:
     """
@@ -1724,7 +1732,8 @@ def compute_node_response(
     key = compute_cache_key(node, inputs, nodes_state)
 
     dep_digests = {}
-    # Populate dependency digests based on node
+
+    # Build dependencyDigests in the exact order: named inputs then cacheKey
     if node == "verify_data":
         dep_digests = {
             "generation": inputs["generation"],
@@ -1739,30 +1748,42 @@ def compute_node_response(
             "cacheKey": key,
         }
     elif node == "train":
+        prepare_art = None
+        if nodes_state["prepare"]["status"] == "succeeded":
+            prepare_art = nodes_state["prepare"]["artifact_digest"]
         dep_digests = {
-            "prepareArtifact": nodes_state["prepare"]["artifact_digest"],
+            "prepareArtifact": prepare_art,
             "trainCode": inputs["trainCode"],
             "trainConfig": inputs["trainConfig"],
             "runtime": inputs["runtime"],
             "cacheKey": key,
         }
     elif node == "evaluate":
+        train_art = None
+        if nodes_state["train"]["status"] == "succeeded":
+            train_art = nodes_state["train"]["artifact_digest"]
         dep_digests = {
-            "trainArtifact": nodes_state["train"]["artifact_digest"],
+            "trainArtifact": train_art,
             "canonicalData": inputs["canonicalData"],
             "evaluateCode": inputs["evaluateCode"],
             "evaluateConfig": inputs["evaluateConfig"],
             "cacheKey": key,
         }
     elif node == "register":
+        evaluate_art = None
+        if nodes_state["evaluate"]["status"] == "succeeded":
+            evaluate_art = nodes_state["evaluate"]["artifact_digest"]
         dep_digests = {
-            "evaluateArtifact": nodes_state["evaluate"]["artifact_digest"],
+            "evaluateArtifact": evaluate_art,
             "schemaDigest": inputs["schemaDigest"],
             "cacheKey": key,
         }
     elif node == "publish":
+        register_art = None
+        if nodes_state["register"]["status"] == "succeeded":
+            register_art = nodes_state["register"]["artifact_digest"]
         dep_digests = {
-            "registerArtifact": nodes_state["register"]["artifact_digest"],
+            "registerArtifact": register_art,
             "publishConfig": inputs["publishConfig"],
             "cacheKey": key,
         }
@@ -1785,7 +1806,6 @@ def compute_node_response(
     status = n["status"]
 
     if status == "succeeded":
-        # Cached
         return {
             "node": node,
             "action": "reuse",
@@ -1829,7 +1849,6 @@ def compute_node_response(
         "dependencyDigests": dep_digests,
         "triggeringEventIds": [],
     }
-
 
 def build_response(
     revision: int,
