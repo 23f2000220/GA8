@@ -832,46 +832,94 @@ def get_candidate_status(candidate: dict, request: dict) -> tuple[str, list[str]
     return ("invalid", ["NOT_LOADABLE"])
 
 
-def validate_freeze_input(body: dict) -> bool:
-    if not isinstance(body, dict):
-        return False
 
+def get_freeze_validation_errors(body: dict) -> list[str]:
+    errors = []
+ 
+    if not isinstance(body, dict):
+        return ["body is not a JSON object"]
+ 
     freeze_id = body.get("freezeId")
     if not isinstance(freeze_id, str) or not (1 <= len(freeze_id) <= 128):
-        return False
-
+        errors.append(f"freezeId invalid: {freeze_id!r}")
+ 
     for digest_key in ("calibrationDigest", "tokenizerDigest"):
-        if not isinstance(body.get(digest_key), str) or body[digest_key] == "":
-            return False
-
+        val = body.get(digest_key)
+        if not isinstance(val, str) or val == "":
+            errors.append(f"{digest_key} missing/empty: {val!r}")
+ 
     allowed_reasons = body.get("allowedUnsupportedReasons")
     if not isinstance(allowed_reasons, list):
-        return False
-    if any(not isinstance(r, str) or r == "" for r in allowed_reasons):
-        return False
-    if len(set(allowed_reasons)) != len(allowed_reasons):
-        return False
-
+        errors.append(f"allowedUnsupportedReasons missing or not a list: {allowed_reasons!r}")
+    else:
+        if any(not isinstance(r, str) or r == "" for r in allowed_reasons):
+            errors.append("allowedUnsupportedReasons contains empty/non-string entries")
+        if len(set(allowed_reasons)) != len(allowed_reasons):
+            errors.append("allowedUnsupportedReasons has duplicates")
+ 
     candidates = body.get("candidates")
     if not isinstance(candidates, list) or len(candidates) == 0:
-        return False
-
-    seen_names = set()
-    for c in candidates:
-        if not isinstance(c, dict):
-            return False
-        name = c.get("name")
-        if not isinstance(name, str) or name == "" or name in seen_names:
-            return False
-        seen_names.add(name)
-
-        files = c.get("files")
-        if not isinstance(files, dict) or len(files) == 0:
-            return False
-        if any(not isinstance(v, str) for v in files.values()):
-            return False
-
-    return True
+        errors.append(f"candidates missing/empty: {candidates!r}")
+    else:
+        seen_names = set()
+        for i, c in enumerate(candidates):
+            if not isinstance(c, dict):
+                errors.append(f"candidates[{i}] is not an object")
+                continue
+            name = c.get("name")
+            if not isinstance(name, str) or name == "":
+                errors.append(f"candidates[{i}].name missing/empty: {name!r}")
+            elif name in seen_names:
+                errors.append(f"candidates[{i}].name duplicate: {name!r}")
+            else:
+                seen_names.add(name)
+ 
+            files = c.get("files")
+            if not isinstance(files, dict) or len(files) == 0:
+                errors.append(f"candidates[{i}] ({name}).files missing/empty: {files!r}")
+            elif any(not isinstance(v, str) for v in files.values()):
+                errors.append(f"candidates[{i}] ({name}).files has non-string values")
+ 
+    return errors
+ 
+ 
+def get_select_validation_errors(body: dict) -> list[str]:
+    errors = []
+    if not isinstance(body, dict):
+        return ["body is not a JSON object"]
+ 
+    if not isinstance(body.get("candidates"), list):
+        errors.append(f"candidates missing or not a list: {body.get('candidates')!r}")
+    if not isinstance(body.get("rows"), list):
+        errors.append(f"rows missing or not a list: {body.get('rows')!r}")
+    if not isinstance(body.get("policy"), dict):
+        errors.append(f"policy missing or not an object: {body.get('policy')!r}")
+ 
+    return errors
+ 
+ 
+# ---------------------------------------------------------------------------
+# Route changes: replace your existing validation calls with these
+# ---------------------------------------------------------------------------
+"""
+if phase == "freeze":
+    errors = get_freeze_validation_errors(body)
+    if errors:
+        logger.info("FREEZE INVALID_INPUT for freezeId=%r: %s", body.get("freezeId"), errors)
+        logger.info("Full body was: %s", body)
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    # ... rest unchanged (replay/conflict check should stay BEFORE this,
+    #     exactly as in your current code - only the validate_freeze_input(body)
+    #     call gets swapped for get_freeze_validation_errors(body))
+ 
+elif phase == "select":
+    errors = get_select_validation_errors(body)
+    if errors:
+        logger.info("SELECT INVALID_INPUT for freezeId=%r: %s", body.get("freezeId"), errors)
+        logger.info("Full body was: %s", body)
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    # ... rest unchanged
+"""
 
 
 def build_freeze_response(body: dict) -> dict:
@@ -924,16 +972,6 @@ def compute_slice_accuracies(rows: list, candidate_name: str, slice_names: list)
     return result
 
 
-def validate_select_input(body: dict) -> bool:
-    if not isinstance(body, dict):
-        return False
-    if not isinstance(body.get("candidates"), list):
-        return False
-    if not isinstance(body.get("rows"), list):
-        return False
-    if not isinstance(body.get("policy"), dict):
-        return False
-    return True
 
 
 def validate_policy(policy: dict, candidate_names: set) -> bool:
@@ -1127,5 +1165,5 @@ async def quantize(request: Request):
         response = build_select_response(body, freeze_id, frozen_response)
         return JSONResponse(response)
 
-    # else:
-    #     return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+    else:
+        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
