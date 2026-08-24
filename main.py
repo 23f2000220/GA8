@@ -817,6 +817,17 @@ def build_inventory_digest(files: dict) -> tuple[list, int, str]:
     return sorted_records, total_bytes, package_digest
 
 
+# --- NEW: per-candidate files validity check (not a global rejection) ---
+def is_valid_files_dict(files) -> bool:
+    if not isinstance(files, dict) or len(files) == 0:
+        return False
+    for k, v in files.items():
+        if not isinstance(k, str) or k == "" or not isinstance(v, str):
+            return False
+    return True
+ 
+
+
 def get_candidate_status(candidate: dict, request: dict) -> tuple[str, list[str]]:
     if candidate.get("unsupportedReason"):
         if candidate.get("unsupportedReason") in request.get("allowedUnsupportedReasons", []):
@@ -833,9 +844,10 @@ def get_candidate_status(candidate: dict, request: dict) -> tuple[str, list[str]
 
 
 
+
+# --- FIXED: global validator no longer touches files ---
 def get_freeze_validation_errors(body: dict) -> list[str]:
     errors = []
- 
     if not isinstance(body, dict):
         return ["body is not a JSON object"]
  
@@ -873,12 +885,9 @@ def get_freeze_validation_errors(body: dict) -> list[str]:
                 errors.append(f"candidates[{i}].name duplicate: {name!r}")
             else:
                 seen_names.add(name)
- 
-            files = c.get("files")
-            if not isinstance(files, dict) or len(files) == 0:
-                errors.append(f"candidates[{i}] ({name}).files missing/empty: {files!r}")
-            elif any(not isinstance(v, str) for v in files.values()):
-                errors.append(f"candidates[{i}] ({name}).files has non-string values")
+            # NOTE: files validity is intentionally NOT checked here anymore -
+            # a candidate with bad files is a per-candidate "invalid" status,
+            # not a request-level rejection. See build_freeze_response.
  
     return errors
  
@@ -922,14 +931,28 @@ elif phase == "select":
 """
 
 
+# --- FIXED: handles per-candidate invalid files without crashing/rejecting ---
 def build_freeze_response(body: dict) -> dict:
     freeze_id = body.get("freezeId")
     results = []
-
+ 
     for candidate in body["candidates"]:
+        files = candidate.get("files")
+ 
+        if not is_valid_files_dict(files):
+            results.append({
+                "name": candidate.get("name"),
+                "status": "invalid",
+                "inventory": [],
+                "totalBytes": None,
+                "packageDigest": None,
+                "reasonCodes": ["INVALID_INPUT"],
+            })
+            continue
+ 
         status_str, reason_codes = get_candidate_status(candidate, body)
-        sorted_records, total_bytes, package_digest = build_inventory_digest(candidate["files"])
-
+        sorted_records, total_bytes, package_digest = build_inventory_digest(files)
+ 
         results.append({
             "name": candidate["name"],
             "status": status_str,
@@ -938,11 +961,11 @@ def build_freeze_response(body: dict) -> dict:
             "packageDigest": package_digest,
             "reasonCodes": reason_codes,
         })
-
+ 
     results_sorted = sorted(results, key=lambda r: r["name"])
     return {"freezeId": freeze_id, "candidates": results_sorted}
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # SELECT phase helpers
 # ---------------------------------------------------------------------------
