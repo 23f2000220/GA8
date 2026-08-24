@@ -1538,11 +1538,6 @@ def process_events(
     events: list[dict[str, Any]],
     request_revision: int,
 ) -> tuple[list[str], list[str], str | None]:
-    """
-    Process a batch of events.
-    Returns (accepted_event_ids, ignored_event_ids, error_code_or_None).
-    If error_code is not None, no state changes should be applied.
-    """
     logger.debug("Processing %d events for session=%s revision=%s", len(events), sess.get("current_revision"), request_revision)
 
     accepted_ids = []
@@ -1559,20 +1554,6 @@ def process_events(
         logger.warning("Rolling back session state due to error")
         sess.clear()
         sess.update(sess_snapshot)
-
-    PARENT_MAP = {
-        "prepare": "verify_data",
-        "train": "prepare",
-        "evaluate": "train",
-        "register": "evaluate",
-        "publish": "register",
-    }
-
-    def parent_is_available(ev_node: str, nodes_state: dict[str, dict[str, Any]]) -> bool:
-        if ev_node == "verify_data":
-            return True
-        parent = PARENT_MAP[ev_node]
-        return nodes_state[parent]["status"] == "succeeded"
 
     for idx, event in enumerate(events):
         logger.debug("Processing event %d: %s", idx, event["eventId"])
@@ -1603,12 +1584,6 @@ def process_events(
             ignored_ids.append(ev_id)
             continue
 
-        # Check parent availability
-        if not parent_is_available(ev_node, nodes_state):
-            logger.debug("Ignoring event: parent unavailable for node=%s", ev_node)
-            ignored_ids.append(ev_id)
-            continue
-
         # Compute expected key for this node
         expected_key = compute_cache_key(ev_node, inputs, nodes_state)
         if ev_key != expected_key:
@@ -1616,8 +1591,7 @@ def process_events(
             ignored_ids.append(ev_id)
             continue
 
-        # At this point, the event is structurally valid, right revision,
-        # parent available, and key matches. Now check event ID uniqueness.
+        # Event ID uniqueness
         new_canonical = compact_json(event)
         if ev_id in event_ids_store:
             existing_canonical = event_ids_store[ev_id]
@@ -1629,9 +1603,6 @@ def process_events(
                 logger.debug("Exact replay of event: %s", ev_id)
                 ignored_ids.append(ev_id)
                 continue
-        # If not in store, we do NOT store yet; we first decide if we will ignore
-        # based on transition rules. If we decide to accept or to ignore for
-        # transition reasons, we must not store the ID if ignoring.
 
         node_state = nodes_state[ev_node]
         cur_status = node_state["status"]
@@ -1660,12 +1631,10 @@ def process_events(
                 node_state["attempt"] = ev_attempt
                 node_state["terminal_event_id"] = ev_id
 
-        # Transition logic per spec
+        # Transition logic
 
-        # Case: none
         if cur_status is None:
             if ev_status == "started" and ev_attempt == 1:
-                # Accept and store event ID
                 event_ids_store[ev_id] = new_canonical
                 accept_event()
                 accepted_ids.append(ev_id)
@@ -1675,7 +1644,6 @@ def process_events(
                 ignored_ids.append(ev_id)
                 continue
 
-        # Case: started(n)
         elif cur_status == "started":
             n = cur_attempt
             if ev_status in ("succeeded", "retryable_failed"):
@@ -1693,7 +1661,6 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
-        # Case: retryable_failed(n)
         elif cur_status == "retryable_failed":
             n = cur_attempt
             if ev_status == "started" and ev_attempt == n + 1:
@@ -1706,7 +1673,6 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
-        # Case: succeeded (cached)
         elif cur_status == "succeeded":
             if ev_status == "succeeded":
                 if ev_art != node_state["artifact_digest"]:
@@ -1722,7 +1688,6 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
-        # Case: terminal_failed
         elif cur_status == "terminal_failed":
             logger.warning("STATUS_CONFLICT: terminal_failed node with new event")
             rollback()
@@ -1735,6 +1700,7 @@ def process_events(
 
     logger.debug("Events processed: accepted=%s ignored=%s", accepted_ids, ignored_ids)
     return accepted_ids, ignored_ids, None
+
 
 def compute_node_response(
     node: str,
