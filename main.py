@@ -779,17 +779,39 @@ async def adapt_endpoint(request: Request):
 #------------q5----------------
 ###############################
 """
-Q5 - Quantize & Admit: FREEZE phase implementation.
+Q5 - Quantize & Admit: complete /quantize endpoint (v2).
 
+Changes from v1:
+- Boolean predictions (True/False) are now correctly rejected, not silently
+  treated as 1/0.
+- When predictions are invalid, `slices` returns {slice_name: None, ...}
+  for every required slice, not an empty {}.
+- Policy numeric fields (maxBytes, aggregateFloor, requiredSlices values,
+  maxLatencyMs) are now checked for actual finiteness, not just >= 0
+  (infinity/NaN previously slipped through).
+- maxBytes is checked against the JS/JSON "safe integer" upper bound.
+- Individual per-candidate latency values (not just the maxLatencyMs
+  ceiling) are now validated as finite non-negative numbers.
+- totalBytes/packageDigest are recomputed from each candidate's own
+  inventory rather than read directly off the submitted dict, and
+  INVALID_MANIFEST fires if that recomputation doesn't match the
+  candidate's own claim (defense-in-depth; in practice rarely reachable
+  since strict lineage equality already catches most tampering - flagging
+  that honestly rather than pretending otherwise).
+- Global lineage/policy failures now fill `slices` with {slice_name: None}
+  per required slice instead of {}.
+
+Merge into your existing app: copy the storage dicts, every function, and
+the single @app.post("/quantize") route into your Q3 app file.
 """
-
 
 import hashlib
 import json
+import math
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-
+app = FastAPI()  # remove if merging into your existing app instance
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -797,9 +819,30 @@ from fastapi.responses import JSONResponse
 FREEZE_REQUESTS: dict[str, dict] = {}
 FREEZE_RESPONSES: dict[str, dict] = {}
 
+SAFE_INT_MAX = 2**53 - 1
+
 
 # ---------------------------------------------------------------------------
-# FREEZE phase helpers
+# Numeric validation helpers
+# ---------------------------------------------------------------------------
+def is_finite_number(x, allow_bool=False) -> bool:
+    if isinstance(x, bool) and not allow_bool:
+        return False
+    if not isinstance(x, (int, float)):
+        return False
+    return math.isfinite(x)
+
+
+def is_safe_nonneg_integer(x) -> bool:
+    if isinstance(x, bool):
+        return False
+    if not isinstance(x, int):
+        return False
+    return 0 <= x <= SAFE_INT_MAX
+
+
+# ---------------------------------------------------------------------------
+# FREEZE phase
 # ---------------------------------------------------------------------------
 def build_inventory_digest(files: dict) -> tuple[list, int, str]:
     records = []
@@ -808,24 +851,11 @@ def build_inventory_digest(files: dict) -> tuple[list, int, str]:
         byte_length = len(content_bytes)
         sha256_hash = hashlib.sha256(content_bytes).hexdigest()
         records.append({"name": name, "bytes": byte_length, "sha256": sha256_hash})
-
     sorted_records = sorted(records, key=lambda r: r["name"])
     total_bytes = sum(r["bytes"] for r in sorted_records)
     package = json.dumps(sorted_records, separators=(",", ":"))
     package_digest = hashlib.sha256(package.encode("utf-8")).hexdigest()
-
     return sorted_records, total_bytes, package_digest
-
-
-# --- NEW: per-candidate files validity check (not a global rejection) ---
-def is_valid_files_dict(files) -> bool:
-    if not isinstance(files, dict) or len(files) == 0:
-        return False
-    for k, v in files.items():
-        if not isinstance(k, str) or k == "" or not isinstance(v, str):
-            return False
-    return True
- 
 
 
 def get_candidate_status(candidate: dict, request: dict) -> tuple[str, list[str]]:
@@ -843,23 +873,29 @@ def get_candidate_status(candidate: dict, request: dict) -> tuple[str, list[str]
     return ("invalid", ["NOT_LOADABLE"])
 
 
+def is_valid_files_dict(files) -> bool:
+    if not isinstance(files, dict) or len(files) == 0:
+        return False
+    for k, v in files.items():
+        if not isinstance(k, str) or k == "" or not isinstance(v, str):
+            return False
+    return True
 
 
-# --- FIXED: global validator no longer touches files ---
 def get_freeze_validation_errors(body: dict) -> list[str]:
     errors = []
     if not isinstance(body, dict):
         return ["body is not a JSON object"]
- 
+
     freeze_id = body.get("freezeId")
     if not isinstance(freeze_id, str) or not (1 <= len(freeze_id) <= 128):
         errors.append(f"freezeId invalid: {freeze_id!r}")
- 
+
     for digest_key in ("calibrationDigest", "tokenizerDigest"):
         val = body.get(digest_key)
         if not isinstance(val, str) or val == "":
             errors.append(f"{digest_key} missing/empty: {val!r}")
- 
+
     allowed_reasons = body.get("allowedUnsupportedReasons")
     if not isinstance(allowed_reasons, list):
         errors.append(f"allowedUnsupportedReasons missing or not a list: {allowed_reasons!r}")
@@ -868,7 +904,7 @@ def get_freeze_validation_errors(body: dict) -> list[str]:
             errors.append("allowedUnsupportedReasons contains empty/non-string entries")
         if len(set(allowed_reasons)) != len(allowed_reasons):
             errors.append("allowedUnsupportedReasons has duplicates")
- 
+
     candidates = body.get("candidates")
     if not isinstance(candidates, list) or len(candidates) == 0:
         errors.append(f"candidates missing/empty: {candidates!r}")
@@ -885,60 +921,19 @@ def get_freeze_validation_errors(body: dict) -> list[str]:
                 errors.append(f"candidates[{i}].name duplicate: {name!r}")
             else:
                 seen_names.add(name)
-            # NOTE: files validity is intentionally NOT checked here anymore -
-            # a candidate with bad files is a per-candidate "invalid" status,
-            # not a request-level rejection. See build_freeze_response.
- 
+            # files validity is per-candidate, handled in build_freeze_response,
+            # NOT a request-level rejection.
+
     return errors
- 
- 
-def get_select_validation_errors(body: dict) -> list[str]:
-    errors = []
-    if not isinstance(body, dict):
-        return ["body is not a JSON object"]
- 
-    if not isinstance(body.get("candidates"), list):
-        errors.append(f"candidates missing or not a list: {body.get('candidates')!r}")
-    if not isinstance(body.get("rows"), list):
-        errors.append(f"rows missing or not a list: {body.get('rows')!r}")
-    if not isinstance(body.get("policy"), dict):
-        errors.append(f"policy missing or not an object: {body.get('policy')!r}")
- 
-    return errors
- 
- 
-# ---------------------------------------------------------------------------
-# Route changes: replace your existing validation calls with these
-# ---------------------------------------------------------------------------
-"""
-if phase == "freeze":
-    errors = get_freeze_validation_errors(body)
-    if errors:
-        logger.info("FREEZE INVALID_INPUT for freezeId=%r: %s", body.get("freezeId"), errors)
-        logger.info("Full body was: %s", body)
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
-    # ... rest unchanged (replay/conflict check should stay BEFORE this,
-    #     exactly as in your current code - only the validate_freeze_input(body)
-    #     call gets swapped for get_freeze_validation_errors(body))
- 
-elif phase == "select":
-    errors = get_select_validation_errors(body)
-    if errors:
-        logger.info("SELECT INVALID_INPUT for freezeId=%r: %s", body.get("freezeId"), errors)
-        logger.info("Full body was: %s", body)
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
-    # ... rest unchanged
-"""
 
 
-# --- FIXED: handles per-candidate invalid files without crashing/rejecting ---
 def build_freeze_response(body: dict) -> dict:
     freeze_id = body.get("freezeId")
     results = []
- 
+
     for candidate in body["candidates"]:
         files = candidate.get("files")
- 
+
         if not is_valid_files_dict(files):
             results.append({
                 "name": candidate.get("name"),
@@ -949,10 +944,10 @@ def build_freeze_response(body: dict) -> dict:
                 "reasonCodes": ["INVALID_INPUT"],
             })
             continue
- 
+
         status_str, reason_codes = get_candidate_status(candidate, body)
         sorted_records, total_bytes, package_digest = build_inventory_digest(files)
- 
+
         results.append({
             "name": candidate["name"],
             "status": status_str,
@@ -961,13 +956,13 @@ def build_freeze_response(body: dict) -> dict:
             "packageDigest": package_digest,
             "reasonCodes": reason_codes,
         })
- 
+
     results_sorted = sorted(results, key=lambda r: r["name"])
     return {"freezeId": freeze_id, "candidates": results_sorted}
- 
- 
+
+
 # ---------------------------------------------------------------------------
-# SELECT phase helpers
+# SELECT phase
 # ---------------------------------------------------------------------------
 def compute_aggregate_accuracy(rows: list, candidate_name: str) -> float | None:
     matches = 0
@@ -975,7 +970,7 @@ def compute_aggregate_accuracy(rows: list, candidate_name: str) -> float | None:
     for row in rows:
         row_count += 1
         prediction = row["predictions"].get(candidate_name)
-        if prediction not in (0, 1):
+        if isinstance(prediction, bool) or prediction not in (0, 1):
             return None
         if prediction == row["label"]:
             matches += 1
@@ -995,28 +990,47 @@ def compute_slice_accuracies(rows: list, candidate_name: str, slice_names: list)
     return result
 
 
+def validate_select_input(body: dict) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if not isinstance(body.get("candidates"), list):
+        return False
+    if not isinstance(body.get("rows"), list):
+        return False
+    if not isinstance(body.get("policy"), dict):
+        return False
+    return True
+
+
+def get_select_validation_errors(body: dict) -> list[str]:
+    errors = []
+    if not isinstance(body, dict):
+        return ["body is not a JSON object"]
+    if not isinstance(body.get("candidates"), list):
+        errors.append(f"candidates missing or not a list: {body.get('candidates')!r}")
+    if not isinstance(body.get("rows"), list):
+        errors.append(f"rows missing or not a list: {body.get('rows')!r}")
+    if not isinstance(body.get("policy"), dict):
+        errors.append(f"policy missing or not an object: {body.get('policy')!r}")
+    return errors
 
 
 def validate_policy(policy: dict, candidate_names: set) -> bool:
-    max_bytes = policy.get("maxBytes")
-    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0:
+    if not is_safe_nonneg_integer(policy.get("maxBytes")):
         return False
 
     agg_floor = policy.get("aggregateFloor")
-    if not isinstance(agg_floor, (int, float)) or isinstance(agg_floor, bool):
-        return False
-    if not (0 <= agg_floor <= 1):
+    if not is_finite_number(agg_floor) or not (0 <= agg_floor <= 1):
         return False
 
     required_slices = policy.get("requiredSlices", {})
     if not isinstance(required_slices, dict):
         return False
     for v in required_slices.values():
-        if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0 <= v <= 1):
+        if not is_finite_number(v) or not (0 <= v <= 1):
             return False
 
-    max_latency = policy.get("maxLatencyMs")
-    if not isinstance(max_latency, (int, float)) or isinstance(max_latency, bool) or max_latency < 0:
+    if not is_finite_number(policy.get("maxLatencyMs")) or policy["maxLatencyMs"] < 0:
         return False
 
     candidate_order = policy.get("candidateOrder")
@@ -1036,6 +1050,23 @@ def check_lineage(submitted_candidates: list, stored_freeze_response: dict | Non
     return submitted_candidates == stored_freeze_response["candidates"]
 
 
+def recompute_manifest(candidate: dict) -> tuple[int | None, str | None, bool]:
+    inventory = candidate.get("inventory")
+    if not isinstance(inventory, list):
+        return None, None, False
+
+    sorted_inv = sorted(inventory, key=lambda r: r["name"])
+    total_bytes = sum(r["bytes"] for r in sorted_inv)
+    package = json.dumps(sorted_inv, separators=(",", ":"))
+    package_digest = hashlib.sha256(package.encode("utf-8")).hexdigest()
+
+    matches_claim = (
+        total_bytes == candidate.get("totalBytes")
+        and package_digest == candidate.get("packageDigest")
+    )
+    return total_bytes, package_digest, matches_claim
+
+
 def evaluate_candidate(frozen_candidate: dict, policy: dict, rows: list, latencies: dict) -> dict:
     name = frozen_candidate["name"]
     codes = []
@@ -1044,21 +1075,25 @@ def evaluate_candidate(frozen_candidate: dict, policy: dict, rows: list, latenci
     if not is_frozen:
         codes.append("NOT_FROZEN")
 
-    total_bytes = frozen_candidate["totalBytes"]
+    recomputed_bytes, recomputed_digest, manifest_ok = recompute_manifest(frozen_candidate)
+    if not manifest_ok:
+        codes.append("INVALID_MANIFEST")
+    total_bytes = recomputed_bytes
+
+    required_slice_names = list(policy.get("requiredSlices", {}).keys())
 
     aggregate = compute_aggregate_accuracy(rows, name)
     predictions_valid = aggregate is not None
 
-    slices = None
     if predictions_valid:
-        slices = compute_slice_accuracies(rows, name, list(policy.get("requiredSlices", {}).keys()))
+        slices = compute_slice_accuracies(rows, name, required_slice_names)
     else:
         codes.append("INVALID_PREDICTIONS")
+        slices = {slice_name: None for slice_name in required_slice_names}
 
     if predictions_valid:
         if aggregate < policy["aggregateFloor"]:
             codes.append("AGGREGATE_FLOOR")
-
         for slice_name, floor in policy.get("requiredSlices", {}).items():
             slice_acc = slices.get(slice_name)
             if slice_acc is None:
@@ -1069,17 +1104,21 @@ def evaluate_candidate(frozen_candidate: dict, policy: dict, rows: list, latenci
     if total_bytes is None or total_bytes > policy["maxBytes"]:
         codes.append("SIZE_LIMIT")
 
-    latency_ms = latencies.get(name)
+    raw_latency = latencies.get(name)
+    if is_finite_number(raw_latency) and raw_latency >= 0:
+        latency_ms = raw_latency
+    else:
+        latency_ms = None
     if latency_ms is None or latency_ms > policy["maxLatencyMs"]:
         codes.append("LATENCY_LIMIT")
 
     codes = sorted(set(codes))
-    admitted = is_frozen and len(codes) == 0
+    admitted = is_frozen and manifest_ok and len(codes) == 0
 
     return {
         "name": name,
         "aggregate": aggregate,
-        "slices": slices if slices is not None else {},
+        "slices": slices,
         "totalBytes": total_bytes,
         "latencyMs": latency_ms,
         "admitted": admitted,
@@ -1091,10 +1130,8 @@ def pick_winner(results: list, candidate_order: list) -> str | None:
     admitted = [r for r in results if r["admitted"]]
     if not admitted:
         return None
-
     def sort_key(r):
         return (r["totalBytes"], r["latencyMs"], candidate_order.index(r["name"]))
-
     admitted.sort(key=sort_key)
     return admitted[0]["name"]
 
@@ -1109,13 +1146,19 @@ def build_select_response(body: dict, freeze_id: str, frozen_response: dict | No
     lineage_ok = check_lineage(submitted_candidates, frozen_response)
     policy_ok = validate_policy(policy, candidate_names) if lineage_ok else False
 
+    required_slice_names = (
+        list(policy.get("requiredSlices", {}).keys())
+        if isinstance(policy.get("requiredSlices"), dict) else []
+    )
+
     results = []
     for candidate in submitted_candidates:
         name = candidate.get("name")
 
         if not lineage_ok:
             results.append({
-                "name": name, "aggregate": None, "slices": {},
+                "name": name, "aggregate": None,
+                "slices": {s: None for s in required_slice_names},
                 "totalBytes": None, "latencyMs": None,
                 "admitted": False, "reasonCodes": ["INVALID_LINEAGE"],
             })
@@ -1123,7 +1166,8 @@ def build_select_response(body: dict, freeze_id: str, frozen_response: dict | No
 
         if not policy_ok:
             results.append({
-                "name": name, "aggregate": None, "slices": {},
+                "name": name, "aggregate": None,
+                "slices": {s: None for s in required_slice_names},
                 "totalBytes": None, "latencyMs": None,
                 "admitted": False, "reasonCodes": ["INVALID_POLICY"],
             })
@@ -1157,13 +1201,12 @@ def build_select_response(body: dict, freeze_id: str, frozen_response: dict | No
 # ---------------------------------------------------------------------------
 # The endpoint
 # ---------------------------------------------------------------------------
-@app.post("/q5/quantize")
+@app.post("/quantize")
 async def quantize(request: Request):
     body = await request.json()
     phase = body.get("phase") if isinstance(body, dict) else None
 
     if phase == "freeze":
-        logger.info("FREEZE request received: %s", body)
         freeze_id = body.get("freezeId") if isinstance(body, dict) else None
 
         if isinstance(freeze_id, str) and freeze_id in FREEZE_REQUESTS:
@@ -1191,3 +1234,713 @@ async def quantize(request: Request):
 
     else:
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+
+############################
+#-----------q6--------------
+#############################
+
+# ----------------------------
+# Constants
+# ----------------------------
+NODES = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
+
+REQUIRED_INPUT_KEYS = [
+    "generation",
+    "checksum",
+    "canonicalData",
+    "prepareCode",
+    "prepareConfig",
+    "trainCode",
+    "trainConfig",
+    "runtime",
+    "evaluateCode",
+    "evaluateConfig",
+    "schemaDigest",
+    "publishConfig",
+]
+
+VALID_STATUSES = {"started", "succeeded", "retryable_failed", "terminal_failed"}
+
+EVENT_FIELDS = [
+    "eventId",
+    "revision",
+    "node",
+    "attempt",
+    "status",
+    "key",
+    "artifactDigest",
+    "receiptId",
+]
+
+# ----------------------------
+# In-memory session store
+# ----------------------------
+sessions: dict[str, dict[str, Any]] = {}
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def compact_json(obj: Any) -> str:
+    """Compact JSON: no spaces, preserve order, UTF-8."""
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def sha256_hex(value_list: list[Any]) -> str:
+    """Lowercase SHA-256 over UTF-8 compact JSON array."""
+    s = compact_json(value_list)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest().lower()
+
+
+def init_node_state() -> dict[str, Any]:
+    return {
+        "key": None,  # current cache key (str or None)
+        "artifact_digest": None,  # first success artifact for this key
+        "status": None,  # None | "started" | "succeeded" | "retryable_failed" | "terminal_failed"
+        "attempt": None,  # int or None
+        "success_event_id": None,  # event ID that first made this node succeed (for this key)
+        "start_event_id": None,  # event ID that started the current attempt
+        "terminal_event_id": None,  # event ID that caused terminal failure
+    }
+
+
+def get_or_create_session(session_id: str, revision: int, inputs: dict[str, Any]):
+    """
+    Get or create session state.
+    Returns (session_dict, error_code_or_None).
+    Handles revision logic and input snapshot.
+    """
+    logger.debug("get_or_create_session: session=%s revision=%s", session_id, revision)
+
+    if session_id not in sessions:
+        logger.info("Creating new session: %s", session_id)
+        sessions[session_id] = {
+            "current_revision": revision,
+            "inputs_snapshot": inputs,  # full inputs dict for this revision
+            "nodes": {node: init_node_state() for node in NODES},
+            "event_ids": {},  # eventId -> canonical JSON string
+        }
+        return sessions[session_id], None
+
+    sess = sessions[session_id]
+    current_rev = sess["current_revision"]
+
+    if revision < current_rev:
+        logger.debug("Older revision request: session=%s req_rev=%s curr_rev=%s", session_id, revision, current_rev)
+        # Older revision: we still allow the request, but events from this revision will be ignored later.
+        # Do NOT change inputs_snapshot or state.
+        return sess, None
+
+    if revision > current_rev:
+        logger.info("New revision: session=%s old_rev=%s new_rev=%s", session_id, current_rev, revision)
+        sess["current_revision"] = revision
+        sess["inputs_snapshot"] = inputs
+
+        # Clear attempt/terminal state, keep succeeded cache entries
+        for node in NODES:
+            n = sess["nodes"][node]
+            if n["status"] != "succeeded":
+                logger.debug("Clearing non-succeeded state for node=%s", node)
+                n["status"] = None
+                n["attempt"] = None
+                n["start_event_id"] = None
+                n["terminal_event_id"] = None
+            # key, artifact_digest, success_event_id remain if succeeded
+
+        return sess, None
+
+    # Same revision: check inputs equality (including extra metadata)
+    if compact_json(inputs) != compact_json(sess["inputs_snapshot"]):
+        logger.warning("REVISION_CONFLICT: session=%s revision=%s inputs changed", session_id, revision)
+        return None, "REVISION_CONFLICT"
+
+    logger.debug("Same revision and inputs: session=%s revision=%s", session_id, revision)
+    return sess, None
+
+
+def validate_request(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Validate top-level request structure.
+    Returns (parsed_data, error_code_or_None).
+    parsed_data = {session, revision, inputs, events}
+    """
+    logger.debug("Validating request body")
+
+    # Basic structure
+    if not isinstance(body, dict):
+        logger.warning("INVALID_REQUEST: body is not a dict")
+        return None, "INVALID_REQUEST"
+
+    session = body.get("session")
+    revision = body.get("revision")
+    inputs = body.get("inputs")
+    events = body.get("events")
+
+    # session: non-empty string
+    if not isinstance(session, str) or session == "":
+        logger.warning("INVALID_REQUEST: session missing or not a non-empty string")
+        return None, "INVALID_REQUEST"
+
+    # revision: positive safe integer
+    if not isinstance(revision, int) or revision <= 0:
+        logger.warning("INVALID_REQUEST: revision must be a positive integer")
+        return None, "INVALID_REQUEST"
+
+    # inputs: dict
+    if not isinstance(inputs, dict):
+        logger.warning("INVALID_REQUEST: inputs must be a dict")
+        return None, "INVALID_REQUEST"
+
+    # Check required input keys: non-empty strings
+    for k in REQUIRED_INPUT_KEYS:
+        v = inputs.get(k)
+        if not isinstance(v, str) or v == "":
+            logger.warning("INVALID_REQUEST: input '%s' missing or not a non-empty string", k)
+            return None, "INVALID_REQUEST"
+
+    # events: list
+    if not isinstance(events, list):
+        logger.warning("INVALID_REQUEST: events must be a list")
+        return None, "INVALID_REQUEST"
+
+    parsed = {
+        "session": session,
+        "revision": revision,
+        "inputs": inputs,
+        "events": events,
+    }
+    logger.debug("Request validation passed")
+    return parsed, None
+
+
+def compute_cache_key(node: str, inputs: dict[str, Any], nodes_state: dict[str, dict[str, Any]]) -> str:
+    """
+    Compute cache key for a node given inputs and upstream artifact digests.
+    """
+    if node == "verify_data":
+        arr = [inputs["generation"], inputs["checksum"]]
+    elif node == "prepare":
+        arr = [inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]]
+    elif node == "train":
+        prepare_art = nodes_state["prepare"]["artifact_digest"]
+        arr = [prepare_art, inputs["trainCode"], inputs["trainConfig"], inputs["runtime"]]
+    elif node == "evaluate":
+        train_art = nodes_state["train"]["artifact_digest"]
+        arr = [train_art, inputs["canonicalData"], inputs["evaluateCode"], inputs["evaluateConfig"]]
+    elif node == "register":
+        evaluate_art = nodes_state["evaluate"]["artifact_digest"]
+        arr = [evaluate_art, inputs["schemaDigest"]]
+    elif node == "publish":
+        register_art = nodes_state["register"]["artifact_digest"]
+        arr = [register_art, inputs["publishConfig"]]
+    else:
+        raise ValueError(f"Unknown node: {node}")
+
+    return sha256_hex(arr)
+
+
+def validate_event_structure(event: dict[str, Any]) -> str | None:
+    """
+    Validate event structure and types.
+    Returns error_code or None.
+    """
+    if not isinstance(event, dict):
+        return "INVALID_EVENT"
+
+    # Exactly 8 fields
+    if set(event.keys()) != set(EVENT_FIELDS):
+        logger.warning("INVALID_EVENT: event fields mismatch: %s", event.keys())
+        return "INVALID_EVENT"
+
+    # eventId: non-empty string
+    if not isinstance(event["eventId"], str) or event["eventId"] == "":
+        return "INVALID_EVENT"
+
+    # revision: positive int
+    if not isinstance(event["revision"], int) or event["revision"] <= 0:
+        return "INVALID_EVENT"
+
+    # node: one of NODES
+    if event["node"] not in NODES:
+        return "INVALID_EVENT"
+
+    # attempt: positive int
+    if not isinstance(event["attempt"], int) or event["attempt"] <= 0:
+        return "INVALID_EVENT"
+
+    # status: one of VALID_STATUSES
+    if event["status"] not in VALID_STATUSES:
+        return "INVALID_EVENT"
+
+    # key: string (allow empty? treat as string)
+    if not isinstance(event["key"], str):
+        return "INVALID_EVENT"
+
+    # artifactDigest: string or null
+    ad = event["artifactDigest"]
+    if ad is not None and not isinstance(ad, str):
+        return "INVALID_EVENT"
+
+    # receiptId: string or null
+    rid = event["receiptId"]
+    if rid is not None and not isinstance(rid, str):
+        return "INVALID_EVENT"
+
+    # Artifact/receipt rules
+    status = event["status"]
+    node = event["node"]
+    key = event["key"]
+
+    if status == "succeeded":
+        # artifactDigest must be non-empty string
+        if not isinstance(ad, str) or ad == "":
+            logger.warning("INVALID_EVENT: succeeded event must have non-empty artifactDigest")
+            return "INVALID_EVENT"
+
+        # receipt rules
+        if node in ("register", "publish"):
+            expected_receipt = f"receipt:{node}:{key}"
+            if rid != expected_receipt:
+                logger.warning(
+                    "INVALID_EVENT: receiptId mismatch for node=%s key=%s expected=%s got=%s",
+                    node, key, expected_receipt, rid,
+                )
+                return "INVALID_EVENT"
+        else:
+            if rid is not None:
+                logger.warning("INVALID_EVENT: non-register/publish succeeded event must have null receiptId")
+                return "INVALID_EVENT"
+    else:
+        # non-succeeded: artifactDigest and receiptId must be null
+        if ad is not None:
+            logger.warning("INVALID_EVENT: non-succeeded event must have null artifactDigest")
+            return "INVALID_EVENT"
+        if rid is not None:
+            logger.warning("INVALID_EVENT: non-succeeded event must have null receiptId")
+            return "INVALID_EVENT"
+
+    return None
+
+
+def process_events(
+    sess: dict[str, Any],
+    inputs: dict[str, Any],
+    events: list[dict[str, Any]],
+    request_revision: int,
+) -> tuple[list[str], list[str], str | None]:
+    """
+    Process a batch of events.
+    Returns (accepted_event_ids, ignored_event_ids, error_code_or_None).
+    If error_code is not None, no state changes should be applied.
+    """
+    logger.debug("Processing %d events for session=%s revision=%s", len(events), sess.get("current_revision"), request_revision)
+
+    accepted_ids = []
+    ignored_ids = []
+
+    nodes_state = sess["nodes"]
+    current_rev = sess["current_revision"]
+    event_ids_store = sess["event_ids"]
+
+    # We'll apply changes tentatively, then commit if no error.
+    # To keep it simple, we'll apply directly but rollback on error by restoring a deep copy.
+    import copy
+    sess_snapshot = copy.deepcopy(sess)
+
+    def rollback():
+        logger.warning("Rolling back session state due to error")
+        sess.clear()
+        sess.update(sess_snapshot)
+
+    for idx, event in enumerate(events):
+        logger.debug("Processing event %d: %s", idx, event["eventId"])
+
+        # Structure validation
+        err = validate_event_structure(event)
+        if err:
+            logger.warning("Event invalid: %s", event["eventId"])
+            rollback()
+            return [], [], err
+
+        ev_id = event["eventId"]
+        ev_rev = event["revision"]
+        ev_node = event["node"]
+        ev_attempt = event["attempt"]
+        ev_status = event["status"]
+        ev_key = event["key"]
+        ev_art = event["artifactDigest"]
+
+        # Revision filter
+        if ev_rev < current_rev:
+            logger.debug("Ignoring event from older revision: %s", ev_id)
+            ignored_ids.append(ev_id)
+            continue
+
+        if ev_rev > current_rev:
+            # Should not normally happen; treat as ignore
+            logger.debug("Ignoring event from future revision: %s", ev_id)
+            ignored_ids.append(ev_id)
+            continue
+
+        # Compute expected key for this node
+        expected_key = compute_cache_key(ev_node, inputs, nodes_state)
+        if ev_key != expected_key:
+            logger.debug("Ignoring event with wrong key: node=%s ev_key=%s expected=%s", ev_node, ev_key, expected_key)
+            ignored_ids.append(ev_id)
+            continue
+
+        # Event ID uniqueness within session
+        if ev_id in event_ids_store:
+            existing_canonical = event_ids_store[ev_id]
+            new_canonical = compact_json(event)
+            if new_canonical != existing_canonical:
+                logger.warning("EVENT_ID_CONFLICT: eventId=%s", ev_id)
+                rollback()
+                return [], [], "EVENT_ID_CONFLICT"
+            else:
+                logger.debug("Exact replay of event: %s", ev_id)
+                ignored_ids.append(ev_id)
+                continue
+        else:
+            # Store canonical JSON for this event ID
+            event_ids_store[ev_id] = compact_json(event)
+
+        # Apply transition rules
+        node_state = nodes_state[ev_node]
+        cur_status = node_state["status"]
+        cur_attempt = node_state["attempt"]
+
+        logger.debug(
+            "Node=%s cur_status=%s cur_attempt=%s incoming_status=%s incoming_attempt=%s",
+            ev_node, cur_status, cur_attempt, ev_status, ev_attempt,
+        )
+
+        def accept_event():
+            # Update node state based on event
+            if ev_status == "started":
+                node_state["status"] = "started"
+                node_state["attempt"] = ev_attempt
+                node_state["start_event_id"] = ev_id
+            elif ev_status == "succeeded":
+                node_state["status"] = "succeeded"
+                node_state["attempt"] = ev_attempt
+                node_state["artifact_digest"] = ev_art
+                node_state["success_event_id"] = ev_id
+            elif ev_status == "retryable_failed":
+                node_state["status"] = "retryable_failed"
+                node_state["attempt"] = ev_attempt
+            elif ev_status == "terminal_failed":
+                node_state["status"] = "terminal_failed"
+                node_state["attempt"] = ev_attempt
+                node_state["terminal_event_id"] = ev_id
+
+        # Transition logic per spec
+        if cur_status is None:
+            if ev_status == "started" and ev_attempt == 1:
+                accept_event()
+                accepted_ids.append(ev_id)
+                continue
+            else:
+                logger.debug("Ignoring event: no prior state, not started(1)")
+                # Remove the event ID we just stored? Spec: "Ignored events do not consume their IDs."
+                # So we should NOT have stored it. We need to undo storing.
+                del event_ids_store[ev_id]
+                ignored_ids.append(ev_id)
+                continue
+
+        elif cur_status == "started":
+            n = cur_attempt
+            if ev_status in ("succeeded", "retryable_failed"):
+                if ev_attempt == n:
+                    accept_event()
+                    accepted_ids.append(ev_id)
+                    continue
+                else:
+                    logger.debug("Ignoring event: started(%s) but attempt mismatch %s", n, ev_attempt)
+                    del event_ids_store[ev_id]
+                    ignored_ids.append(ev_id)
+                    continue
+            else:
+                logger.warning("STATUS_CONFLICT: started -> %s", ev_status)
+                rollback()
+                return [], [], "STATUS_CONFLICT"
+
+        elif cur_status == "retryable_failed":
+            n = cur_attempt
+            if ev_status == "started" and ev_attempt == n + 1:
+                accept_event()
+                accepted_ids.append(ev_id)
+                continue
+            else:
+                logger.warning("STATUS_CONFLICT: retryable_failed -> %s attempt=%s", ev_status, ev_attempt)
+                rollback()
+                return [], [], "STATUS_CONFLICT"
+
+        elif cur_status == "succeeded":
+            # Already cached for this key
+            if ev_status == "succeeded":
+                if ev_art != node_state["artifact_digest"]:
+                    logger.warning("EVIDENCE_CONFLICT: node=%s different artifact", ev_node)
+                    rollback()
+                    return [], [], "EVIDENCE_CONFLICT"
+                else:
+                    # Same artifact: treat as replay? But event ID is new, so this is a conflict per spec:
+                    # "succeeded/current cache | any other new event | STATUS_CONFLICT"
+                    logger.warning("STATUS_CONFLICT: succeeded node with new success event")
+                    rollback()
+                    return [], [], "STATUS_CONFLICT"
+            else:
+                logger.warning("STATUS_CONFLICT: succeeded node with non-success event")
+                rollback()
+                return [], [], "STATUS_CONFLICT"
+
+        elif cur_status == "terminal_failed":
+            logger.warning("STATUS_CONFLICT: terminal_failed node with new event")
+            rollback()
+            return [], [], "STATUS_CONFLICT"
+
+        else:
+            logger.warning("STATUS_CONFLICT: unknown state")
+            rollback()
+            return [], [], "STATUS_CONFLICT"
+
+    logger.debug("Events processed: accepted=%s ignored=%s", accepted_ids, ignored_ids)
+    return accepted_ids, ignored_ids, None
+
+
+def compute_node_response(
+    node: str,
+    inputs: dict[str, Any],
+    nodes_state: dict[str, dict[str, Any]],
+    upstream_blocked: tuple[bool, str] | None,
+) -> dict[str, Any]:
+    """
+    Compute response for a single node.
+    upstream_blocked = (is_blocked, reason) or None.
+    reason in {"UPSTREAM_TERMINAL", "UPSTREAM_PENDING"}
+    """
+    n = nodes_state[node]
+    key = compute_cache_key(node, inputs, nodes_state)
+
+    dep_digests = {}
+    # Populate dependency digests based on node
+    if node == "verify_data":
+        dep_digests = {
+            "generation": inputs["generation"],
+            "checksum": inputs["checksum"],
+            "cacheKey": key,
+        }
+    elif node == "prepare":
+        dep_digests = {
+            "canonicalData": inputs["canonicalData"],
+            "prepareCode": inputs["prepareCode"],
+            "prepareConfig": inputs["prepareConfig"],
+            "cacheKey": key,
+        }
+    elif node == "train":
+        dep_digests = {
+            "prepareArtifact": nodes_state["prepare"]["artifact_digest"],
+            "trainCode": inputs["trainCode"],
+            "trainConfig": inputs["trainConfig"],
+            "runtime": inputs["runtime"],
+            "cacheKey": key,
+        }
+    elif node == "evaluate":
+        dep_digests = {
+            "trainArtifact": nodes_state["train"]["artifact_digest"],
+            "canonicalData": inputs["canonicalData"],
+            "evaluateCode": inputs["evaluateCode"],
+            "evaluateConfig": inputs["evaluateConfig"],
+            "cacheKey": key,
+        }
+    elif node == "register":
+        dep_digests = {
+            "evaluateArtifact": nodes_state["evaluate"]["artifact_digest"],
+            "schemaDigest": inputs["schemaDigest"],
+            "cacheKey": key,
+        }
+    elif node == "publish":
+        dep_digests = {
+            "registerArtifact": nodes_state["register"]["artifact_digest"],
+            "publishConfig": inputs["publishConfig"],
+            "cacheKey": key,
+        }
+
+    triggering_event_ids = []
+
+    # If upstream is blocked
+    if upstream_blocked is not None:
+        is_blocked, reason = upstream_blocked
+        if is_blocked:
+            return {
+                "node": node,
+                "action": "block",
+                "reasonCodes": [reason],
+                "dependencyDigests": dep_digests,
+                "triggeringEventIds": [],
+            }
+
+    # Determine own state
+    status = n["status"]
+
+    if status == "succeeded":
+        # Cached
+        return {
+            "node": node,
+            "action": "reuse",
+            "reasonCodes": ["CACHE_HIT"],
+            "dependencyDigests": dep_digests,
+            "triggeringEventIds": [n["success_event_id"]] if n["success_event_id"] else [],
+        }
+
+    if status == "started":
+        return {
+            "node": node,
+            "action": "block",
+            "reasonCodes": ["RUNNING"],
+            "dependencyDigests": dep_digests,
+            "triggeringEventIds": [n["start_event_id"]] if n["start_event_id"] else [],
+        }
+
+    if status == "terminal_failed":
+        return {
+            "node": node,
+            "action": "block",
+            "reasonCodes": ["TERMINAL_FAILURE"],
+            "dependencyDigests": dep_digests,
+            "triggeringEventIds": [n["terminal_event_id"]] if n["terminal_event_id"] else [],
+        }
+
+    if status == "retryable_failed":
+        return {
+            "node": node,
+            "action": "rerun",
+            "reasonCodes": ["RETRYABLE_FAILURE"],
+            "dependencyDigests": dep_digests,
+            "triggeringEventIds": [],
+        }
+
+    # No state / cache miss
+    return {
+        "node": node,
+        "action": "rerun",
+        "reasonCodes": ["CACHE_MISS"],
+        "dependencyDigests": dep_digests,
+        "triggeringEventIds": [],
+    }
+
+
+def build_response(
+    revision: int,
+    accepted_ids: list[str],
+    ignored_ids: list[str],
+    inputs: dict[str, Any],
+    nodes_state: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    logger.debug("Building response for revision=%s", revision)
+
+    nodes_response = []
+    upstream_blocked = None  # (is_blocked, reason)
+
+    for node in NODES:
+        # Determine upstream blocking
+        if node == "verify_data":
+            ub = None
+        else:
+            # Find immediate upstream
+            upstream_map = {
+                "prepare": "verify_data",
+                "train": "prepare",
+                "evaluate": "train",
+                "register": "evaluate",
+                "publish": "register",
+            }
+            up = upstream_map[node]
+            up_state = nodes_state[up]
+            up_status = up_state["status"]
+
+            if up_status == "terminal_failed":
+                ub = (True, "UPSTREAM_TERMINAL")
+            elif up_status in ("started", "retryable_failed", None):
+                # If upstream is not succeeded, downstream is pending/blocked
+                # But if upstream is None (no state), and not terminal, we treat as pending
+                ub = (True, "UPSTREAM_PENDING")
+            else:
+                ub = None
+
+        node_resp = compute_node_response(node, inputs, nodes_state, ub)
+        nodes_response.append(node_resp)
+
+        # Propagate blocking
+        if node_resp["action"] == "block":
+            reason = node_resp["reasonCodes"][0]
+            if reason == "TERMINAL_FAILURE":
+                upstream_blocked = (True, "UPSTREAM_TERMINAL")
+            elif reason in ("RUNNING", "UPSTREAM_PENDING", "UPSTREAM_TERMINAL"):
+                upstream_blocked = (True, "UPSTREAM_PENDING")
+
+    response = {
+        "revision": revision,
+        "acceptedEventIds": accepted_ids,
+        "ignoredEventIds": ignored_ids,
+        "nodes": nodes_response,
+    }
+    logger.debug("Response built: %s", compact_json(response))
+    return response
+
+
+def handle_pipeline_request(body: dict[str, Any]) -> dict[str, Any]:
+    logger.info("Handling /pipeline request")
+
+    # Validate request
+    parsed, err = validate_request(body)
+    if err:
+        logger.warning("Request validation failed: %s", err)
+        return {"error": err}
+
+    session_id = parsed["session"]
+    revision = parsed["revision"]
+    inputs = parsed["inputs"]
+    events = parsed["events"]
+
+    # Get/create session
+    sess, err = get_or_create_session(session_id, revision, inputs)
+    if err:
+        logger.warning("Session/revision error: %s", err)
+        return {"error": err}
+
+    # Process events
+    accepted_ids, ignored_ids, err = process_events(sess, inputs, events, revision)
+    if err:
+        logger.warning("Event processing error: %s", err)
+        return {"error": err}
+
+    # Build response
+    response = build_response(revision, accepted_ids, ignored_ids, inputs, sess["nodes"])
+    logger.info("Request handled successfully")
+    return response
+
+
+@app.post("/q6/pipeline")
+async def pipeline_endpoint(request: Request):
+    logger.info("Received POST /pipeline")
+    try:
+        body = await request.json()
+    except Exception as e:
+        logger.warning("Failed to parse JSON: %s", e)
+        return JSONResponse(
+            status_code=409,
+            content={"error": "INVALID_REQUEST"},
+        )
+
+    result = handle_pipeline_request(body)
+    if "error" in result:
+        logger.warning("Returning 409 error: %s", result["error"])
+        return JSONResponse(
+            status_code=409,
+            content={"error": result["error"]},
+        )
+
+    logger.debug("Returning success response")
+    return JSONResponse(status_code=200, content=result)
