@@ -1448,6 +1448,7 @@ def compute_cache_key(node: str, inputs: dict[str, Any], nodes_state: dict[str, 
 
     return sha256_hex(arr)
 
+
 def validate_event_structure(event: dict[str, Any]) -> str | None:
     """
     Validate event structure and types.
@@ -1551,8 +1552,6 @@ def process_events(
     current_rev = sess["current_revision"]
     event_ids_store = sess["event_ids"]
 
-    # We'll apply changes tentatively, then commit if no error.
-    # To keep it simple, we'll apply directly but rollback on error by restoring a deep copy.
     import copy
     sess_snapshot = copy.deepcopy(sess)
 
@@ -1560,6 +1559,20 @@ def process_events(
         logger.warning("Rolling back session state due to error")
         sess.clear()
         sess.update(sess_snapshot)
+
+    PARENT_MAP = {
+        "prepare": "verify_data",
+        "train": "prepare",
+        "evaluate": "train",
+        "register": "evaluate",
+        "publish": "register",
+    }
+
+    def parent_is_available(ev_node: str, nodes_state: dict[str, dict[str, Any]]) -> bool:
+        if ev_node == "verify_data":
+            return True
+        parent = PARENT_MAP[ev_node]
+        return nodes_state[parent]["status"] == "succeeded"
 
     for idx, event in enumerate(events):
         logger.debug("Processing event %d: %s", idx, event["eventId"])
@@ -1586,8 +1599,13 @@ def process_events(
             continue
 
         if ev_rev > current_rev:
-            # Should not normally happen; treat as ignore
             logger.debug("Ignoring event from future revision: %s", ev_id)
+            ignored_ids.append(ev_id)
+            continue
+
+        # Check parent availability
+        if not parent_is_available(ev_node, nodes_state):
+            logger.debug("Ignoring event: parent unavailable for node=%s", ev_node)
             ignored_ids.append(ev_id)
             continue
 
@@ -1598,10 +1616,11 @@ def process_events(
             ignored_ids.append(ev_id)
             continue
 
-        # Event ID uniqueness within session
+        # At this point, the event is structurally valid, right revision,
+        # parent available, and key matches. Now check event ID uniqueness.
+        new_canonical = compact_json(event)
         if ev_id in event_ids_store:
             existing_canonical = event_ids_store[ev_id]
-            new_canonical = compact_json(event)
             if new_canonical != existing_canonical:
                 logger.warning("EVENT_ID_CONFLICT: eventId=%s", ev_id)
                 rollback()
@@ -1610,11 +1629,10 @@ def process_events(
                 logger.debug("Exact replay of event: %s", ev_id)
                 ignored_ids.append(ev_id)
                 continue
-        else:
-            # Store canonical JSON for this event ID
-            event_ids_store[ev_id] = compact_json(event)
+        # If not in store, we do NOT store yet; we first decide if we will ignore
+        # based on transition rules. If we decide to accept or to ignore for
+        # transition reasons, we must not store the ID if ignoring.
 
-        # Apply transition rules
         node_state = nodes_state[ev_node]
         cur_status = node_state["status"]
         cur_attempt = node_state["attempt"]
@@ -1625,7 +1643,6 @@ def process_events(
         )
 
         def accept_event():
-            # Update node state based on event
             if ev_status == "started":
                 node_state["status"] = "started"
                 node_state["attempt"] = ev_attempt
@@ -1644,29 +1661,31 @@ def process_events(
                 node_state["terminal_event_id"] = ev_id
 
         # Transition logic per spec
+
+        # Case: none
         if cur_status is None:
             if ev_status == "started" and ev_attempt == 1:
+                # Accept and store event ID
+                event_ids_store[ev_id] = new_canonical
                 accept_event()
                 accepted_ids.append(ev_id)
                 continue
             else:
                 logger.debug("Ignoring event: no prior state, not started(1)")
-                # Remove the event ID we just stored? Spec: "Ignored events do not consume their IDs."
-                # So we should NOT have stored it. We need to undo storing.
-                del event_ids_store[ev_id]
                 ignored_ids.append(ev_id)
                 continue
 
+        # Case: started(n)
         elif cur_status == "started":
             n = cur_attempt
             if ev_status in ("succeeded", "retryable_failed"):
                 if ev_attempt == n:
+                    event_ids_store[ev_id] = new_canonical
                     accept_event()
                     accepted_ids.append(ev_id)
                     continue
                 else:
                     logger.debug("Ignoring event: started(%s) but attempt mismatch %s", n, ev_attempt)
-                    del event_ids_store[ev_id]
                     ignored_ids.append(ev_id)
                     continue
             else:
@@ -1674,9 +1693,11 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
+        # Case: retryable_failed(n)
         elif cur_status == "retryable_failed":
             n = cur_attempt
             if ev_status == "started" and ev_attempt == n + 1:
+                event_ids_store[ev_id] = new_canonical
                 accept_event()
                 accepted_ids.append(ev_id)
                 continue
@@ -1685,16 +1706,14 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
+        # Case: succeeded (cached)
         elif cur_status == "succeeded":
-            # Already cached for this key
             if ev_status == "succeeded":
                 if ev_art != node_state["artifact_digest"]:
                     logger.warning("EVIDENCE_CONFLICT: node=%s different artifact", ev_node)
                     rollback()
                     return [], [], "EVIDENCE_CONFLICT"
                 else:
-                    # Same artifact: treat as replay? But event ID is new, so this is a conflict per spec:
-                    # "succeeded/current cache | any other new event | STATUS_CONFLICT"
                     logger.warning("STATUS_CONFLICT: succeeded node with new success event")
                     rollback()
                     return [], [], "STATUS_CONFLICT"
@@ -1703,6 +1722,7 @@ def process_events(
                 rollback()
                 return [], [], "STATUS_CONFLICT"
 
+        # Case: terminal_failed
         elif cur_status == "terminal_failed":
             logger.warning("STATUS_CONFLICT: terminal_failed node with new event")
             rollback()
@@ -1715,7 +1735,6 @@ def process_events(
 
     logger.debug("Events processed: accepted=%s ignored=%s", accepted_ids, ignored_ids)
     return accepted_ids, ignored_ids, None
-
 
 def compute_node_response(
     node: str,
@@ -1890,6 +1909,17 @@ def build_response(
 
         node_resp = compute_node_response(node, inputs, nodes_state, ub)
         nodes_response.append(node_resp)
+
+
+        # Debug log for cache/dependency correctness
+        logger.debug(
+            "Node=%s action=%s reasons=%s cacheKey=%s dep_digests=%s",
+            node,
+            node_resp["action"],
+            node_resp["reasonCodes"],
+            node_resp["dependencyDigests"]["cacheKey"],
+            node_resp["dependencyDigests"],
+        )
 
         # Propagate blocking
         if node_resp["action"] == "block":
