@@ -1140,6 +1140,7 @@ async def quantize(request: Request):
     phase = body.get("phase") if isinstance(body, dict) else None
 
     if phase == "freeze":
+        logger.info("FREEZE request received: %s", body)
         freeze_id = body.get("freezeId") if isinstance(body, dict) else None
 
         if isinstance(freeze_id, str) and freeze_id in FREEZE_REQUESTS:
